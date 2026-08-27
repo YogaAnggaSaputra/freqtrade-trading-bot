@@ -1,0 +1,579 @@
+services:
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: ${DB_USER:-botbinance}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME:-botbinance}
+      POSTGRES_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-botbinance} -d ${DB_NAME:-botbinance}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 512M
+
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redisdata:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 256M
+
+  binance-adapter:
+    build:
+      context: .
+      dockerfile: services/binance-adapter/Dockerfile
+    environment:
+      BINANCE_FUTURES_TESTNET: ${BINANCE_FUTURES_TESTNET:-false}
+      BINANCE_FUTURES_BASE_URL: ${BINANCE_FUTURES_BASE_URL:-https://fapi.binance.com}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-botbinance}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-botbinance}
+    ports:
+      - "127.0.0.1:8001:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    secrets:
+      - binance_api_key
+      - binance_api_secret
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  freqtrade-runtime:
+    build:
+      context: .
+      dockerfile: services/freqtrade-runtime/Dockerfile
+    environment:
+      FREQTRADE_STRATEGY: ${FREQTRADE_STRATEGY:-AITradingStrategy}
+      TRADE_MODE: ${TRADE_MODE:-demo}
+      BINANCE_FUTURES_TESTNET: ${BINANCE_FUTURES_TESTNET:-false}
+      BINANCE_FUTURES_BASE_URL: ${BINANCE_FUTURES_BASE_URL:-https://fapi.binance.com}
+      BINANCE_ADAPTER_URL: http://binance-adapter:8000
+      RISK_GATEWAY_URL: http://risk-gateway:8000
+      MODEL_INFERENCE_URL: http://model-inference:8000
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-botbinance}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-botbinance}
+      FREQTRADE_WEBHOOK_TOKEN: ${FREQTRADE_WEBHOOK_TOKEN:-}
+    ports:
+      - "127.0.0.1:8002:8080"
+    volumes:
+      - ./configs/freqtrade:/freqtrade/configs
+      - freqtradeuserdata:/freqtrade/user_data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      binance-adapter:
+        condition: service_started
+      risk-gateway:
+        condition: service_started
+      model-inference:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    secrets:
+      - binance_api_key
+      - binance_api_secret
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1.5G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
+
+  risk-gateway:
+    build:
+      context: .
+      dockerfile: services/risk-gateway/Dockerfile
+    environment:
+      TRADE_MODE: ${TRADE_MODE:-demo}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-botbinance}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-botbinance}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      BINANCE_ADAPTER_URL: http://binance-adapter:8000
+      EQUITY_FALLBACK_USDT: ${EQUITY_FALLBACK_USDT:-10000}
+      MARKET_DATA_GATEWAY_URL: http://market-data-gateway:8000
+      MODEL_INFERENCE_URL: http://model-inference:8000
+      # Macro News Calendar Filter
+      MACRO_ENABLED: ${MACRO_ENABLED:-true}
+      MACRO_BLOCK_MINUTES_BEFORE: ${MACRO_BLOCK_MINUTES_BEFORE:-30}
+      MACRO_BLOCK_MINUTES_AFTER: ${MACRO_BLOCK_MINUTES_AFTER:-60}
+      MACRO_CURRENCIES: ${MACRO_CURRENCIES:-USD,EUR,GBP}
+      MACRO_REFRESH_HOURS: ${MACRO_REFRESH_HOURS:-6}
+      # Fractional Kelly Position Sizer
+      KELLY_ENABLED: ${KELLY_ENABLED:-true}
+      KELLY_FRACTION: ${KELLY_FRACTION:-0.25}
+      KELLY_MAX_PCT: ${KELLY_MAX_PCT:-0.01}
+      KELLY_MIN_PCT: ${KELLY_MIN_PCT:-0.001}
+      KELLY_LOOKBACK_TRADES: ${KELLY_LOOKBACK_TRADES:-30}
+      # Spread & Volatility Guard
+      SPREAD_GUARD_ENABLED: ${SPREAD_GUARD_ENABLED:-true}
+      SPREAD_MAX_Z_SCORE: ${SPREAD_MAX_Z_SCORE:-2.5}
+      VOLATILITY_GUARD_ENABLED: ${VOLATILITY_GUARD_ENABLED:-true}
+      VOLATILITY_MAX_SURGE_PCT: ${VOLATILITY_MAX_SURGE_PCT:-50.0}
+      # Kill Switch PIN (override in production!)
+      KILL_SWITCH_PIN: ${KILL_SWITCH_PIN:-CONFIRM-KILL}
+    volumes:
+      - ./configs/risk-gateway/policy.yaml:/config/policy.yaml:ro
+    ports:
+      - "127.0.0.1:8003:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      binance-adapter:
+        condition: service_started
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  market-data-gateway:
+    build:
+      context: .
+      dockerfile: services/market-data-gateway/Dockerfile
+    environment:
+      BINANCE_FUTURES_TESTNET: ${BINANCE_FUTURES_TESTNET:-false}
+      MARKET_SYMBOLS: ${MARKET_SYMBOLS:-BTC/USDT:USDT,ETH/USDT:USDT,BNB/USDT:USDT,SOL/USDT:USDT,XRP/USDT:USDT,ADA/USDT:USDT,DOGE/USDT:USDT,DOT/USDT:USDT,AVAX/USDT:USDT,MATIC/USDT:USDT,LINK/USDT:USDT,UNI/USDT:USDT,LTC/USDT:USDT,ATOM/USDT:USDT,APE/USDT:USDT,SAND/USDT:USDT,MANA/USDT:USDT,AXS/USDT:USDT,SHIB/USDT:USDT,FTM/USDT:USDT}
+      MARKET_SYMBOLS_ALL: ${MARKET_SYMBOLS_ALL:-BTC/USDT:USDT,ETH/USDT:USDT,BNB/USDT:USDT,SOL/USDT:USDT,XRP/USDT:USDT,ADA/USDT:USDT,DOGE/USDT:USDT,DOT/USDT:USDT,AVAX/USDT:USDT,MATIC/USDT:USDT,LINK/USDT:USDT,UNI/USDT:USDT,LTC/USDT:USDT,ATOM/USDT:USDT,APE/USDT:USDT,SAND/USDT:USDT,MANA/USDT:USDT,AXS/USDT:USDT,SHIB/USDT:USDT,FTM/USDT:USDT,1000BONK/USDT:USDT,1000CAT/USDT:USDT,1000CHEEMS/USDT:USDT,1000FLOKI/USDT:USDT,1000LUNC/USDT:USDT,1000PEPE/USDT:USDT,1000RATS/USDT:USDT,1000SATS/USDT:USDT,1000SHIB/USDT:USDT,1000XEC/USDT:USDT,AAVE/USDT:USDT,ACE/USDT:USDT,ACH/USDT:USDT,ACT/USDT:USDT,AGIX/USDT:USDT,AI/USDT:USDT,AIXBT/USDT:USDT,ALICE/USDT:USDT,ALPHA/USDT:USDT,AMP/USDT:USDT,ANKR/USDT:USDT,AR/USDT:USDT,ARKM/USDT:USDT,ARPA/USDT:USDT,ASTR/USDT:USDT,ATA/USDT:USDT,AUDIO/USDT:USDT,AVT/USDT:USDT,BADGER/USDT:USDT,BAKE/USDT:USDT,BAL/USDT:USDT,BAND/USDT:USDT,BAT/USDT:USDT,BEAR/USDT:USDT,BETA/USDT:USDT,BICO/USDT:USDT,BID/USDT:USDT,BIGTIME/USDT:USDT,BLESS/USDT:USDT,BLUR/USDT:USDT,BNT/USDT:USDT,BONK/USDT:USDT,BSW/USDT:USDT,BTCST/USDT:USDT,C98/USDT:USDT,CALL/USDT:USDT,CARV/USDT:USDT,CELR/USDT:USDT,CETUS/USDT:USDT,CFX/USDT:USDT,COMBO/USDT:USDT,COTI/USDT:USDT,COW/USDT:USDT,CRV/USDT:USDT,CTC/USDT:USDT,CTSI/USDT:USDT,CVC/USDT:USDT,DASH/USDT:USDT,DATA/USDT:USDT,DCR/USDT:USDT,DEGO/USDT:USDT,DENT/USDT:USDT,DIA/USDT:USDT,DODO/USDT:USDT,DRIFT/USDT:USDT,DUSK/USDT:USDT,DYDX/USDT:USDT,DYM/USDT:USDT,EGLD/USDT:USDT,ELF/USDT:USDT,ENS/USDT:USDT,ETHFI/USDT:USDT,EPX/USDT:USDT,ETC/USDT:USDT,FARM/USDT:USDT,FET/USDT:USDT,FLOW/USDT:USDT,FLUX/USDT:USDT,FOR/USDT:USDT,FRONT/USDT:USDT,FTT/USDT:USDT,FUN/USDT:USDT,GALA/USDT:USDT,GAS/USDT:USDT,GHST/USDT:USDT,GLM/USDT:USDT,GMT/USDT:USDT,GOAT/USDT:USDT,GRT/USDT:USDT,GTC/USDT:USDT,HBAR/USDT:USDT,HEDG/USDT:USDT,HEX/USDT:USDT,HIGH/USDT:USDT,HIVE/USDT:USDT,HOT/USDT:USDT,ICP/USDT:USDT,ICX/USDT:USDT,IDEX/USDT:USDT,ILV/USDT:USDT,IMX/USDT:USDT,INJ/USDT:USDT,IOST/USDT:USDT,IOTA/USDT:USDT,JASMY/USDT:USDT,JOE/USDT:USDT,JST/USDT:USDT,KAVA/USDT:USDT,KDA/USDT:USDT,KMD/USDT:USDT,KNC/USDT:USDT,KP3R/USDT:USDT,KSM/USDT:USDT,LDO/USDT:USDT,LEVER/USDT:USDT,LISTA/USDT:USDT,LPT/USDT:USDT,LQTY/USDT:USDT,LRC/USDT:USDT,LSK/USDT:USDT,LTO/USDT:USDT,MAGIC/USDT:USDT,MANA/USDT:USDT,MASK/USDT:USDT,MATIC/USDT:USDT,MBL/USDT:USDT,MCO/USDT:USDT,MC/USDT:USDT,MDT/USDT:USDT,MEME/USDT:USDT,METIS/USDT:USDT,MFT/USDT:USDT,MINA/USDT:USDT,MIR/USDT:USDT,MNGO/USDT:USDT,MOVE/USDT:USDT,MTL/USDT:USDT,MUST/USDT:USDT,NAVI/USDT:USDT,NBS/USDT:USDT,NCASH/USDT:USDT,NKN/USDT:USDT,NMR/USDT:USDT,NOT/USDT:USDT,NU/USDT:USDT,NULS/USDT:USDT,OCEAN/USDT:USDT,OGN/USDT:USDT,OMG/USDT:USDT,ONE/USDT:USDT,ONG/USDT:USDT,ONT/USDT:USDT,OP/USDT:USDT,ORN/USDT:USDT,OX/USDT:USDT,PAXG/USDT:USDT,PERL/USDT:USDT,PERP/USDT:USDT,PHA/USDT:USDT,PHB/USDT:USDT,PIXEL/USDT:USDT,PLA/USDT:USDT,POLS/USDT:USDT,POND/USDT:USDT,POWR/USDT:USDT,PROM/USDT:USDT,PROS/USDT:USDT,PSG/USDT:USDT,PUNDIX/USDT:USDT,PYR/USDT:USDT,PYTH/USDT:USDT,QI/USDT:USDT,QNT/USDT:USDT,QSP/USDT:USDT,QUICK/USDT:USDT,RAD/USDT:USDT,RARE/USDT:USDT,RAY/USDT:USDT,REEF/USDT:USDT,REQ/USDT:USDT,RLC/USDT:USDT,RNDR/USDT:USDT,ROSE/USDT:USDT,RSR/USDT:USDT,RUNE/USDT:USDT,SAND/USDT:USDT,SANTOS/USDT:USDT,SCRT/USDT:USDT,SFP/USDT:USDT,SHRAP/USDT:USDT,SKL/USDT:USDT,SLP/USDT:USDT,SNX/USDT:USDT,SOL/USDT:USDT,SPELL/USDT:USDT,SRM/USDT:USDT,STMX/USDT:USDT,STORJ/USDT:USDT,STX/USDT:USDT,SUSHI/USDT:USDT,SXP/USDT:USDT,SYN/USDT:USDT,SYS/USDT:USDT,T/USDT:USDT,TBTC/USDT:USDT,TEMP/USDT:USDT,TENG/USDT:USDT,TKO/USDT:USDT,TLM/USDT:USDT,TRYB/USDT:USDT,TSC/USDT:USDT,TUSD/USDT:USDT,TWT/USDT:USDT,UMA/USDT:USDT,UNFI/USDT:USDT,UNI/USDT:USDT,UP/USDT:USDT,UQS/USDT:USDT,USDP/USDT:USDT,UST/USDT:USDT,VCE/USDT:USDT,VELO/USDT:USDT,VET/USDT:USDT,VGX/USDT:USDT,VITE/USDT:USDT,VTHO/USDT:USDT,WAVES/USDT:USDT,WAXP/USDT:USDT,WLD/USDT:USDT,WNXM/USDT:USDT,WOO/USDT:USDT,WRX/USDT:USDT,XEM/USDT:USDT,XLM/USDT:USDT,XMR/USDT:USDT,XRD/USDT:USDT,XRP/USDT:USDT,XTZ/USDT:USDT,XVG/USDT:USDT,XVS/USDT:USDT,YFI/USDT:USDT,YFII/USDT:USDT,YGG/USDT:USDT,ZEN/USDT:USDT,ZEC/USDT:USDT,ZIL/USDT:USDT,ZKJ/USDT:USDT,ZRX/USDT:USDT}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-botbinance}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-botbinance}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      # Liquidation Cascade Monitor
+      LIQUIDATION_CASCADE_WINDOW_SEC: ${LIQUIDATION_CASCADE_WINDOW_SEC:-60}
+      LIQUIDATION_CASCADE_THRESHOLD_USD: ${LIQUIDATION_CASCADE_THRESHOLD_USD:-1000000}
+    ports:
+      - "127.0.0.1:8004:8000"
+    volumes:
+      - marketdata:/data/parquet
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  reconciler:
+    build:
+      context: .
+      dockerfile: services/reconciler/Dockerfile
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-botbinance}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-botbinance}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+
+  hermes-agent:
+    build:
+      context: .
+      dockerfile: services/hermes-agent/Dockerfile
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-botbinance}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-botbinance}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      HERMES_INTERVAL_HOURS: ${HERMES_INTERVAL_HOURS:-6}
+      HERMES_LOOKBACK_DAYS: ${HERMES_LOOKBACK_DAYS:-14}
+      HERMES_MIN_SAMPLES: ${HERMES_MIN_SAMPLES:-20}
+    ports:
+      - "127.0.0.1:8006:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  loss-analyzer:
+    build:
+      context: .
+      dockerfile: services/loss-analyzer/Dockerfile
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-botbinance}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-botbinance}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      LOSS_ANALYSIS_INTERVAL_HOURS: ${LOSS_ANALYSIS_INTERVAL_HOURS:-4}
+      ACTIVE_STRATEGY_VERSION: ${ACTIVE_STRATEGY_VERSION:-AITradingStrategy}
+    ports:
+      - "127.0.0.1:8007:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  model-inference:
+    build:
+      context: .
+      dockerfile: services/model-inference/Dockerfile
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-botbinance}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-botbinance}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      MODEL_DIR: /models
+      MODEL_VERSION: ${MODEL_VERSION:-v1_rule_based}
+      FEATURE_VERSION: ${FEATURE_VERSION:-v1.0}
+      # MLOps Autopilot Retraining Scheduler
+      RETRAIN_INTERVAL_DAYS: ${RETRAIN_INTERVAL_DAYS:-7}
+      MIN_CANDLES_FOR_GMM: ${MIN_CANDLES_FOR_GMM:-500}
+      MIN_TRADES_FOR_MAE_MFE: ${MIN_TRADES_FOR_MAE_MFE:-50}
+      GMM_CANDLE_LOOKBACK_DAYS: ${GMM_CANDLE_LOOKBACK_DAYS:-90}
+      MAE_MFE_LOOKBACK_DAYS: ${MAE_MFE_LOOKBACK_DAYS:-180}
+      # Ensemble ML + Uncertainty Filter
+      UNCERTAINTY_ENABLED: ${UNCERTAINTY_ENABLED:-true}
+      UNCERTAINTY_MIN_CONFIDENCE: ${UNCERTAINTY_MIN_CONFIDENCE:-0.70}
+      UNCERTAINTY_MAX_STD_DEV: ${UNCERTAINTY_MAX_STD_DEV:-0.20}
+      UNCERTAINTY_MAX_ENTROPY: ${UNCERTAINTY_MAX_ENTROPY:-0.65}
+    volumes:
+      - modeldata:/models
+    ports:
+      - "127.0.0.1:8005:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768M
+        reservations:
+          cpus: "0.25"
+          memory: 384M
+
+  experiment-orchestrator:
+    build:
+      context: .
+      dockerfile: services/experiment-orchestrator/Dockerfile
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-botbinance}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-botbinance}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      BACKTEST_CONFIG: ${BACKTEST_CONFIG:-config.backtest.json}
+      STRATEGY_NAME: ${STRATEGY_NAME:-AITradingStrategy}
+      # Optuna AutoML Hyperparameter Optimizer
+      OPTUNA_ENABLED: ${OPTUNA_ENABLED:-true}
+      OPTUNA_TRIALS: ${OPTUNA_TRIALS:-50}
+      OPTUNA_TIMEOUT_SECONDS: ${OPTUNA_TIMEOUT_SECONDS:-3600}
+      OPTUNA_SAMPLER: ${OPTUNA_SAMPLER:-tpe}
+      # Strategy Decay Detection
+      DECAY_ENABLED: ${DECAY_ENABLED:-true}
+      DECAY_SHORT_WINDOW_DAYS: ${DECAY_SHORT_WINDOW_DAYS:-7}
+      DECAY_LONG_WINDOW_DAYS: ${DECAY_LONG_WINDOW_DAYS:-30}
+      DECAY_SHARPE_THRESHOLD: ${DECAY_SHARPE_THRESHOLD:-0.70}
+      DECAY_WINRATE_THRESHOLD: ${DECAY_WINRATE_THRESHOLD:-0.85}
+      # Auto-accept Hermes proposals (set false for manual approval)
+      AUTO_ACCEPT_PROPOSALS: ${AUTO_ACCEPT_PROPOSALS:-true}
+      # Fase 4: model-inference URL untuk promotion gate REST calls
+      MODEL_INFERENCE_URL: http://model-inference:8000
+    ports:
+      - "127.0.0.1:8008:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  # ─── Limit Maker Order Chasing ──────────────────────────────────────────────
+  # (Configured in binance-adapter via env vars when that service is extended)
+
+  discord-bot:
+    build:
+      context: .
+      dockerfile: services/discord-bot/Dockerfile
+    environment:
+      DISCORD_CHANNEL_ID: ${DISCORD_CHANNEL_ID}
+      DISCORD_ALERT_CHANNEL_ID: ${DISCORD_ALERT_CHANNEL_ID:-${DISCORD_CHANNEL_ID}}
+      DISCORD_AUTHORIZED_USER_ID: ${DISCORD_AUTHORIZED_USER_ID}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-botbinance}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-botbinance}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    secrets:
+      - discord_bot_token
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+
+  # ─── Monitoring ─────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+    volumes:
+      - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheusdata:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 256M
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_INSTALL_PLUGINS: grafana-clock-panel
+    volumes:
+      - grafanadata:/var/lib/grafana
+      - ./configs/grafana/provisioning:/etc/grafana/provisioning
+      - ./configs/grafana/dashboards:/etc/grafana/dashboards
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    volumes:
+      - ./configs/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+      - alertmanagerdata:/alertmanager
+    ports:
+      - "127.0.0.1:9093:9093"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+
+  # ─── Host metrics exporters ────────────────────────────────────────────────
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    command:
+      - "--housekeeping_interval=30s"
+      - "--docker_only=true"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped
+    privileged: true
+    devices:
+      - /dev/kmsg
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    command:
+      - "--path.rootfs=/host"
+    pid: host
+    volumes:
+      - /:/host:ro
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+    ports:
+      - "127.0.0.1:9100:9100"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
+volumes:
+  pgdata:
+  redisdata:
+  marketdata:
+  modeldata:
+  freqtradeuserdata:
+  prometheusdata:
+  grafanadata:
+  alertmanagerdata:
+
+secrets:
+  binance_api_key:
+    file: ./secrets/binance_api_key.txt
+  binance_api_secret:
+    file: ./secrets/binance_api_secret.txt
+  discord_bot_token:
+    file: ./secrets/discord_bot_token.txt
