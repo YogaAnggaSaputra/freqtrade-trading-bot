@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libpq-dev curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Build context = root project (lihat docker-compose.yml)
+COPY services/discord-bot/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Shared library + kode service
+COPY shared/ shared/
+COPY services/discord-bot/ .
+
+CMD ["python", "main.py"]
