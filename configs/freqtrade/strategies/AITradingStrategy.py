@@ -428,10 +428,13 @@ class AITradingStrategy(IStrategy):
     max_entry_sl_pct     = 0.02
 
     # Partial TP levels (R-multiple) — dipakai di adjust_trade_position
-    # Skala scalping (timeframe 5m): TP lebih dekat agar cepat lock profit.
-    tp1_rrr       = 5.0     # TP1 di 5R (dulu 1.0R = terlalu ketat, cuma 0.27% profit)
-    tp2_rrr       = 10.0    # TP2 di 10R (dulu 1.8R)
-    tp3_rrr       = 20.0    # TP3 di 20R (dulu 3.0R, full close)
+    # [FIX 2026-08-28] Turunkan dari 5R/10R/20R → 1.5R/2.5R/4R
+    # Data 149 trade: Mean 1.16R, Median 1.00R, Max 5.00R
+    # Hanya 0.7% trade capai ≥5R, 7.9% capai ≥2R, 73.6% capai ≥1R
+    # TP statis terlalu tinggi = jarang tercapai → stoploss_exit mendominasi
+    tp1_rrr       = 1.5     # TP1 di 1.5R (realistis: 73.6% trade capai ≥1R)
+    tp2_rrr       = 2.5     # TP2 di 2.5R (realistis: 7.9% trade capai ≥2R)
+    tp3_rrr       = 4.0     # TP3 di 4.0R (max observed 5R, buffer 4R cukup)
     tp1_close_pct = 0.40    # Close 40% di TP1
     tp2_close_pct = 0.35    # Close 35% di TP2 (sisanya runner ke TP3)
 
