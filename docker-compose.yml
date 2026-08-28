@@ -119,9 +119,9 @@ services:
       binance-adapter:
         condition: service_started
       risk-gateway:
-        condition: service_started
+        condition: service_healthy
       model-inference:
-        condition: service_started
+        condition: service_healthy
       redis:
         condition: service_healthy
     secrets:
@@ -185,6 +185,12 @@ services:
         condition: service_healthy
       binance-adapter:
         condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
     deploy:
       resources:
@@ -362,6 +368,12 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
     deploy:
       resources:
