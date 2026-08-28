@@ -961,15 +961,30 @@ class AITradingStrategy(IStrategy):
             age_candles = 999.0
         grace_active = age_candles < 5.0
 
-        # [FIX-CRITICAL] Urutan cek dibalik: 2R harus dicek SEBELUM 1R.
-        # Sebelumnya 1R dicek duluan sehingga kondisi 2R tidak pernah tercapai.
+        # [FIX-CRITICAL] Urutan cek dibalik: 3R → 2R → 1R.
+        # Progressive lock: makin tinggi profit, SL makin ketat.
 
-        # Trail ke lock 0.5R setelah 2R profit (dicek duluan)
-        if profit_abs >= 2 * one_r:
+        # ── [LAYER-5] Progressive Lock di zona runner (2R+) ──
+        # Tambah step lock baru: 3R lock 1.5R, 4R lock 2.5R
+        # Ini mencegah runner revert jauh sebelum TP3
+        if profit_abs >= 4 * one_r:
+            # Lock 2.5R di 4R profit (hampir TP3)
             if trade.is_short:
-                sl_price = open_rate - 0.5 * one_r  # Lock 0.5R untuk short
+                sl_price = open_rate - 2.5 * one_r
             else:
-                sl_price = open_rate + 0.5 * one_r  # Lock 0.5R untuk long
+                sl_price = open_rate + 2.5 * one_r
+        elif profit_abs >= 3 * one_r:
+            # Lock 1.5R di 3R profit
+            if trade.is_short:
+                sl_price = open_rate - 1.5 * one_r
+            else:
+                sl_price = open_rate + 1.5 * one_r
+        elif profit_abs >= 2 * one_r:
+            # Lock 0.5R di 2R profit (TP2)
+            if trade.is_short:
+                sl_price = open_rate - 0.5 * one_r
+            else:
+                sl_price = open_rate + 0.5 * one_r
         # Trail ke breakeven setelah 1R profit
         elif profit_abs >= one_r:
             sl_price = open_rate       # Breakeven (sama untuk long & short)
@@ -985,19 +1000,34 @@ class AITradingStrategy(IStrategy):
                 sl_dist_eff = max((open_rate - struct_long) / 1.0, open_rate * 0.015)
             else:
                 sl_dist_eff = max(sl_dist, open_rate * 0.015)
-            # [LAYER-1] Trailing halus di zona 0→1R: lock 40% PEAK profit.
-            # Pakai max_rate/min_rate (monotonic dari freqtrade) — SL gak pernah
-            # turun balik saat harga retrace. max()/min() dgn SL awal = anti-bounce.
+
+            # ── [LAYER-1] Dynamic Trail Percentage ──
+            # Trail makin ketat seiring profit naik (0→1R zone):
+            # - 0→0.5R: trail 50% peak (longgar, beri ruang)
+            # - 0.5R→1R: trail 30% peak (mulai ketat)
+            # Ini lebih adaptif daripada fixed 40%
             if trade.is_short:
                 sl_initial = open_rate + sl_dist_eff + sl_offset  # SL awal di atas entry
                 peak_profit_abs = max(0.0, open_rate - (trade.min_rate or current_rate))
+
+                # Dynamic trail percentage
+                if peak_profit_abs >= 0.5 * one_r:
+                    trail_pct = 0.30  # 30% trail saat profit 0.5R+
+                else:
+                    trail_pct = 0.50  # 50% trail saat profit <0.5R
+
                 # Grace period: SL awal doang, tanpa trail — biar entry-noise
                 # (1-2 candle) gak langsung sapu. Setelah 5 candle baru trail.
                 if grace_active:
                     sl_price = sl_initial
                 elif peak_profit_abs > 0 and current_profit >= 0.005:
-                    trail_sl = current_rate + 0.4 * peak_profit_abs
-                    sl_price = min(sl_initial, max(trail_sl, current_rate + sl_offset))
+                    # [LAYER-3] ATR-Based Trail Width
+                    # Gunakan ATR live untuk menyesuaikan trail width
+                    # Volatility tinggi → trail lebar, volatility rendah → trail sempit
+                    atr_trail_width = max(0.5 * atr, current_rate * 0.003)
+                    trail_sl = current_rate + (trail_pct * peak_profit_abs)
+                    # Pastikan trail tidak lebih lebar dari ATR trail width
+                    sl_price = min(sl_initial, max(trail_sl, current_rate + atr_trail_width))
                 else:
                     sl_price = sl_initial
                 # [SAFETY] SL short HARUS di atas harga minimal 0.15% — cegah -2021.
@@ -1005,17 +1035,52 @@ class AITradingStrategy(IStrategy):
             else:
                 sl_initial = open_rate - sl_dist_eff - sl_offset  # SL awal di bawah entry
                 peak_profit_abs = max(0.0, (trade.max_rate or current_rate) - open_rate)
+
+                # Dynamic trail percentage
+                if peak_profit_abs >= 0.5 * one_r:
+                    trail_pct = 0.30  # 30% trail saat profit 0.5R+
+                else:
+                    trail_pct = 0.50  # 50% trail saat profit <0.5R
+
                 # Grace period: SL awal doang, tanpa trail — biar entry-noise
                 # (1-2 candle) gak langsung sapu. Setelah 5 candle baru trail.
                 if grace_active:
                     sl_price = sl_initial
                 elif peak_profit_abs > 0 and current_profit >= 0.005:
-                    trail_sl = current_rate - 0.4 * peak_profit_abs
-                    sl_price = max(sl_initial, min(trail_sl, current_rate - sl_offset))
+                    # [LAYER-3] ATR-Based Trail Width
+                    atr_trail_width = max(0.5 * atr, current_rate * 0.003)
+                    trail_sl = current_rate - (trail_pct * peak_profit_abs)
+                    sl_price = max(sl_initial, min(trail_sl, current_rate - atr_trail_width))
                 else:
                     sl_price = sl_initial
                 # [SAFETY] SL long HARUS di bawah harga minimal 0.15% — cegah -2021.
                 sl_price = min(sl_price, current_rate * 0.997)
+
+            # ── [LAYER-4] Ratchet SL — SL hanya boleh NAIK, tidak boleh TURUN ──
+            # Ambil SL sebelumnya dari CustomDataWrapper
+            # Ini memastikan SL tidak pernah turun (hanya naik atau tetap)
+            try:
+                prev_sl_data = CustomDataWrapper.get_custom_data(
+                    trade_id=trade.id, cd_key="current_sl"
+                )
+                if prev_sl_data:
+                    prev_sl = float(prev_sl_data[0].value)
+                    # Ratchet: hanya naik, tidak pernah turun
+                    if trade.is_short:
+                        sl_price = min(sl_price, prev_sl)  # Short: SL di atas, makin kecil makin baik
+                    else:
+                        sl_price = max(sl_price, prev_sl)  # Long: SL di bawah, makin besar makin baik
+            except Exception:
+                pass  # Fail-open, pakai SL yang dihitung
+
+        # ── [LAYER-6] Simpan SL saat ini ke CustomDataWrapper ──
+        # Untuk ratchet di call berikutnya
+        try:
+            CustomDataWrapper.set_custom_data(
+                trade.id, "current_sl", float(sl_price)
+            )
+        except Exception:
+            pass
 
         # [LAYER-4] Invalidation by CLOSE, bukan wick: SL dievaluasi terhadap
         # close candle terakhir (bukan current_rate live) — wick nembus level
