@@ -1036,6 +1036,25 @@ class AITradingStrategy(IStrategy):
             # Pastikan tidak positif (SL long harus di bawah harga)
             stoploss_pct = min(-0.003, stoploss_pct)
 
+        # [FIX-TRIGGER] Cegah "Order would immediately trigger" (-2021).
+        # Kalau SL price sudah tidak valid (SL long > current price, atau
+        # SL short < current price), skip update — biarkan SL lama tetap aktif.
+        # Update hanya kalau SL price masih di area yang valid.
+        if trade.is_short:
+            # SL short harus di ATAS current price
+            if sl_price <= current_rate:
+                logger.debug(
+                    f"[{pair}] SL short {sl_price:.4f} <= current {current_rate:.4f} — skip update"
+                )
+                return None  # Skip update, biarkan SL lama
+        else:
+            # SL long harus di BAWAH current price
+            if sl_price >= current_rate:
+                logger.debug(
+                    f"[{pair}] SL long {sl_price:.4f} >= current {current_rate:.4f} — skip update"
+                )
+                return None  # Skip update, biarkan SL lama
+
         # [FIX-EMERGENCY] Cegah "Order would immediately trigger" (-2021) setelah restart.
         # Kalau harga pasar SUDAH melewati stop baru (mis. gap harga saat bot down/restart),
         # freqtrade bakal gagal pasang SL → panic emergency_exit di loss lebih dalam.
