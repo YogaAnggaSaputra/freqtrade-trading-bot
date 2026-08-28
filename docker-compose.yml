@@ -152,7 +152,8 @@ services:
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       BINANCE_ADAPTER_URL: http://binance-adapter:8000
-      EQUITY_FALLBACK_USDT: ${EQUITY_FALLBACK_USDT:-10000}
+      # Conservative emergency fallback only; live equity should come from exchange.
+      EQUITY_FALLBACK_USDT: ${EQUITY_FALLBACK_USDT:-10}
       MARKET_DATA_GATEWAY_URL: http://market-data-gateway:8000
       MODEL_INFERENCE_URL: http://model-inference:8000
       # Macro News Calendar Filter
@@ -411,7 +412,7 @@ services:
       DECAY_SHARPE_THRESHOLD: ${DECAY_SHARPE_THRESHOLD:-0.70}
       DECAY_WINRATE_THRESHOLD: ${DECAY_WINRATE_THRESHOLD:-0.85}
       # Auto-accept Hermes proposals (set false for manual approval)
-      AUTO_ACCEPT_PROPOSALS: ${AUTO_ACCEPT_PROPOSALS:-true}
+      AUTO_ACCEPT_PROPOSALS: ${AUTO_ACCEPT_PROPOSALS:-false}
       # Fase 4: model-inference URL untuk promotion gate REST calls
       MODEL_INFERENCE_URL: http://model-inference:8000
     ports:
