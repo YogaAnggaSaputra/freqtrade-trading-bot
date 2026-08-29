@@ -5,6 +5,7 @@ FastAPI service untuk kalkulasi fitur teknikal dan inferensi model ML.
 Dipanggil oleh Freqtrade Strategy via HTTP setiap candle baru.
 """
 import asyncio
+import math
 import os
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -614,6 +615,76 @@ PRODUCTION_MODEL_PATH = os.path.join(PROMOTE_MODEL_DIR, "ensemble_stacking.pkl")
 CANDIDATE_MODEL_PATH = os.path.join(PROMOTE_MODEL_DIR, "ensemble_stack_candidate.pkl")
 
 
+def _score_serialized_ensemble(model_data: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Score a saved ensemble on time-ordered trade outcome features.
+
+    This is deliberately independent from the in-memory champion so candidate
+    and production are evaluated from the exact artifacts that would be
+    promoted. Rows with missing features are skipped and counted explicitly.
+    """
+    feature_names = [str(name) for name in (model_data.get("feature_names") or [])]
+    base_models = model_data.get("base_models") or {}
+    available_models = [name for name in (model_data.get("available_models") or base_models.keys())
+                        if name in base_models]
+    meta_learner = model_data.get("meta_learner")
+    if not feature_names or not available_models or meta_learner is None:
+        return {"scored": 0, "skipped": len(rows), "error": "invalid_serialized_ensemble"}
+
+    vectors: list[list[float]] = []
+    labels: list[int] = []
+    skipped = 0
+    for row in rows:
+        conditions = row.get("entry_conditions") or {}
+        features = conditions.get("features") if isinstance(conditions, dict) else None
+        if not isinstance(features, dict):
+            skipped += 1
+            continue
+        try:
+            vector = [float(features[name]) for name in feature_names]
+            pnl = float(row.get("pnl_pct"))
+        except (KeyError, TypeError, ValueError):
+            skipped += 1
+            continue
+        if not all(math.isfinite(value) for value in vector) or not math.isfinite(pnl):
+            skipped += 1
+            continue
+        vectors.append(vector)
+        labels.append(1 if pnl > 0 else 0)
+
+    if not vectors:
+        return {"scored": 0, "skipped": skipped, "error": "no_compatible_holdout_rows"}
+
+    X = np.asarray(vectors, dtype=float)
+    base_matrix: list[np.ndarray] = []
+    base_errors: dict[str, str] = {}
+    for name in available_models:
+        try:
+            probabilities = np.asarray(base_models[name].predict_proba(X), dtype=float)[:, 1]
+            base_matrix.append(probabilities)
+        except Exception as exc:  # noqa: BLE001
+            base_errors[name] = str(exc)
+    if not base_matrix:
+        return {"scored": 0, "skipped": skipped, "error": "base_model_prediction_failed", "base_errors": base_errors}
+
+    meta_X = np.column_stack(base_matrix)
+    try:
+        probabilities = np.asarray(meta_learner.predict_proba(meta_X), dtype=float)[:, 1]
+    except Exception as exc:  # noqa: BLE001
+        return {"scored": 0, "skipped": skipped, "error": f"meta_model_prediction_failed: {exc}"}
+    labels_arr = np.asarray(labels, dtype=int)
+    predictions = (probabilities >= 0.5).astype(int)
+    accuracy = float(np.mean(predictions == labels_arr))
+    brier = float(np.mean((probabilities - labels_arr) ** 2))
+    return {
+        "scored": len(labels),
+        "skipped": skipped,
+        "accuracy": round(accuracy, 6),
+        "brier_score": round(brier, 6),
+        "mean_probability": round(float(np.mean(probabilities)), 6),
+        "base_errors": base_errors,
+    }
+
+
 @app.get("/models/list", response_model=dict[str, Any])
 async def list_model_files():
     """List model files in /models (untuk inventory endpoint Fase 4)."""
@@ -635,7 +706,6 @@ async def evaluate_candidate():
     bukan silent skip (operator perlu tahu).
     """
     import pickle as _pickle
-    import numpy as _np
     from sqlalchemy import text as _text
     from shared.db.session import AsyncSessionLocal as _S
 
@@ -672,7 +742,7 @@ async def evaluate_candidate():
             FROM trade_outcomes
             WHERE timestamp_exit IS NOT NULL
               AND entry_conditions ? 'features'
-            ORDER BY timestamp_exit DESC
+            ORDER BY timestamp_exit ASC
         """))
         outcomes = list(result.mappings().all())
 
@@ -680,15 +750,30 @@ async def evaluate_candidate():
     holdout_start = int(n_total * 0.7)
     holdout = outcomes[holdout_start:]
 
+    if cand_metrics.get("loaded"):
+        cand_metrics["holdout"] = _score_serialized_ensemble(cand_data, holdout)
+    if prod_metrics.get("loaded"):
+        prod_metrics["holdout"] = _score_serialized_ensemble(prod_data, holdout)
+    candidate_score = (cand_metrics.get("holdout") or {}).get("accuracy")
+    production_score = (prod_metrics.get("holdout") or {}).get("accuracy")
+    delta = None
+    if candidate_score is not None and production_score is not None:
+        delta = round(candidate_score - production_score, 6)
+
     return {
         "candidate": cand_metrics,
         "production": prod_metrics,
+        "comparison": {
+            "candidate_accuracy": candidate_score,
+            "production_accuracy": production_score,
+            "accuracy_delta": delta,
+        },
         "dataset": {
             "total_outcomes": n_total,
             "holdout_size": len(holdout),
             "train_size": holdout_start,
         },
-        "note": "Skor aktual butuh eksekusi model.predict_proba; disediakan oleh endpoint terpisah jika ensemble sudah terlatih dengan cukup data.",
+        "note": "Evaluasi time-based holdout; baris tanpa feature lengkap dilewati dan dihitung di skipped. Hasil ini tidak menggantikan shadow 48 jam.",
     }
 
 
@@ -703,8 +788,27 @@ async def promote_candidate(version_id: str | None = None):
     from sqlalchemy import update as _update, text as _text
     from shared.db.session import AsyncSessionLocal as _S
 
+    if not version_id:
+        raise HTTPException(status_code=400, detail="version_id is required for shadow-gated promotion")
     if not os.path.exists(CANDIDATE_MODEL_PATH):
         raise HTTPException(status_code=404, detail="No candidate model to promote")
+
+    # Promotion is only allowed after the durable challenger window has
+    # settled. `review_required` is the explicit manual-approval path when
+    # AUTO_PROMOTE_CHALLENGER is disabled; neither state can be reached before
+    # the 48-hour/sample/accuracy checks in experiment-orchestrator.
+    async with _S() as db:
+        shadow = await db.execute(_text("""
+            SELECT status, samples FROM model_shadow_evaluations
+            WHERE version_id=:version_id
+        """), {"version_id": version_id})
+        shadow_row = shadow.mappings().first()
+    if not shadow_row or shadow_row["status"] not in {"passed", "review_required"}:
+        status = shadow_row["status"] if shadow_row else "missing"
+        raise HTTPException(
+            status_code=409,
+            detail=f"challenger shadow gate not passed (status={status})",
+        )
 
     # Backup production lama
     ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
@@ -721,36 +825,22 @@ async def promote_candidate(version_id: str | None = None):
     # Update model_versions DB
     promoted_count = 0
     async with _S() as db:
-        if version_id:
-            await db.execute(_update(
-                __import__("shared.db.models", fromlist=["ModelVersion"]).ModelVersion
-            ).where(
-                __import__("shared.db.models", fromlist=["ModelVersion"]).ModelVersion.version_id == version_id
-            ).values(
-                status="production",
-                promoted_at=datetime.now(UTC).replace(tzinfo=None),
-            ))
-            promoted_count = await db.execute(_text(
-                "SELECT COUNT(*) FROM model_versions WHERE version_id=:v AND status='production'"
-            ), {"v": version_id})
-            promoted_count = promoted_count.scalar() or 0
-        else:
-            # Archive semua production lama, lalu set candidate status ke production via timestamp terbaru
-            await db.execute(_text("""
-                UPDATE model_versions SET status='archived'
-                WHERE status='production'
-            """))
-            await db.execute(_text("""
-                UPDATE model_versions SET status='production', promoted_at=NOW()
-                WHERE version_id=(
-                    SELECT version_id FROM model_versions
-                    WHERE status='candidate' ORDER BY trained_at DESC LIMIT 1
-                )
-            """))
-            promoted_count = await db.execute(_text(
-                "SELECT COUNT(*) FROM model_versions WHERE status='production'"
-            ))
-            promoted_count = promoted_count.scalar() or 0
+        await db.execute(_text("""
+            UPDATE model_versions SET status='archived'
+            WHERE status='production'
+        """))
+        await db.execute(_update(
+            __import__("shared.db.models", fromlist=["ModelVersion"]).ModelVersion
+        ).where(
+            __import__("shared.db.models", fromlist=["ModelVersion"]).ModelVersion.version_id == version_id
+        ).values(
+            status="production",
+            promoted_at=datetime.now(UTC).replace(tzinfo=None),
+        ))
+        promoted_count = await db.execute(_text(
+            "SELECT COUNT(*) FROM model_versions WHERE version_id=:v AND status='production'"
+        ), {"v": version_id})
+        promoted_count = promoted_count.scalar() or 0
         await db.commit()
 
     return {

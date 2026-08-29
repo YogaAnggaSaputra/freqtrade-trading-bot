@@ -26,6 +26,18 @@ services:
           cpus: "0.25"
           memory: 512M
 
+  migrations:
+    build:
+      context: .
+      dockerfile: services/db-migrations/Dockerfile
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://botbinance:${DB_PASSWORD:-changeme}@postgres:5432/botbinance}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["ops"]
+    restart: "no"
+
   redis:
     image: redis:7-alpine
     command: >
@@ -99,6 +111,28 @@ services:
       BINANCE_ADAPTER_URL: http://binance-adapter:8000
       RISK_GATEWAY_URL: http://risk-gateway:8000
       MODEL_INFERENCE_URL: http://model-inference:8000
+      QUANT_ENGINE_URL: http://quant-engine:8000
+      QUANT_ENGINE_ENABLED: ${QUANT_ENGINE_ENABLED:-true}
+      QUANT_FACTOR_SCORE_ENABLED: ${QUANT_FACTOR_SCORE_ENABLED:-false}
+      SENTIMENT_ENGINE_URL: http://sentiment-engine:8000
+      SENTIMENT_ENGINE_ENABLED: ${SENTIMENT_ENGINE_ENABLED:-false}
+      ON_CHAIN_ENGINE_URL: http://on-chain-engine:8000
+      ON_CHAIN_ENGINE_ENABLED: ${ON_CHAIN_ENGINE_ENABLED:-false}
+      NEWS_ALPHA_URL: http://news-alpha:8000
+      NEWS_ALPHA_ENABLED: ${NEWS_ALPHA_ENABLED:-false}
+      NEWS_HEADLINE: ${NEWS_HEADLINE:-}
+      ADAPTIVE_WHITELIST_URL: http://adaptive-whitelist:8000
+      ADAPTIVE_WHITELIST_ENABLED: ${ADAPTIVE_WHITELIST_ENABLED:-false}
+      ORDERBOOK_GATE_ENABLED: ${ORDERBOOK_GATE_ENABLED:-false}
+      ORDERBOOK_INTELLIGENCE_ENABLED: ${ORDERBOOK_INTELLIGENCE_ENABLED:-false}
+      ORDERBOOK_SPOOFING_MAX: ${ORDERBOOK_SPOOFING_MAX:-0.70}
+      ORDERBOOK_GATE_MIN_IMBALANCE: ${ORDERBOOK_GATE_MIN_IMBALANCE:-0.08}
+      EXIT_CONSENSUS_ENABLED: ${EXIT_CONSENSUS_ENABLED:-false}
+      EXIT_CONSENSUS_THRESHOLD: ${EXIT_CONSENSUS_THRESHOLD:-0.65}
+      POSITION_RISK_ENABLED: ${POSITION_RISK_ENABLED:-false}
+      POSITION_MONITOR_ENABLED: ${POSITION_MONITOR_ENABLED:-false}
+      POSITION_MONITOR_URL: http://position-monitor:8000
+      CAPITAL_ALLOCATION_ENABLED: ${CAPITAL_ALLOCATION_ENABLED:-false}
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD}
@@ -175,6 +209,11 @@ services:
       VOLATILITY_MAX_SURGE_PCT: ${VOLATILITY_MAX_SURGE_PCT:-50.0}
       # Kill Switch PIN (override in production!)
       KILL_SWITCH_PIN: ${KILL_SWITCH_PIN:-CONFIRM-KILL}
+      ANOMALY_AUTO_PAUSE: ${ANOMALY_AUTO_PAUSE:-true}
+      EXECUTION_AUTO_PAUSE: ${EXECUTION_AUTO_PAUSE:-false}
+      DEAD_MAN_ENABLED: ${DEAD_MAN_ENABLED:-false}
+      DEAD_MAN_SYMBOL: ${DEAD_MAN_SYMBOL:-BTCUSDT}
+      DEAD_MAN_TIMEOUT_SECONDS: ${DEAD_MAN_TIMEOUT_SECONDS:-1800}
     volumes:
       - ./configs/risk-gateway/policy.yaml:/config/policy.yaml:ro
     ports:
@@ -351,6 +390,7 @@ services:
       FEATURE_VERSION: ${FEATURE_VERSION:-v1.0}
       # MLOps Autopilot Retraining Scheduler
       RETRAIN_INTERVAL_DAYS: ${RETRAIN_INTERVAL_DAYS:-7}
+      AUTO_RETRAIN_ENABLED: ${AUTO_RETRAIN_ENABLED:-false}
       MIN_CANDLES_FOR_GMM: ${MIN_CANDLES_FOR_GMM:-500}
       MIN_TRADES_FOR_MAE_MFE: ${MIN_TRADES_FOR_MAE_MFE:-50}
       GMM_CANDLE_LOOKBACK_DAYS: ${GMM_CANDLE_LOOKBACK_DAYS:-90}
@@ -415,6 +455,9 @@ services:
       AUTO_ACCEPT_PROPOSALS: ${AUTO_ACCEPT_PROPOSALS:-false}
       # Fase 4: model-inference URL untuk promotion gate REST calls
       MODEL_INFERENCE_URL: http://model-inference:8000
+      AUTO_PROMOTE_CHALLENGER: ${AUTO_PROMOTE_CHALLENGER:-false}
+      CHALLENGER_SHADOW_HOURS: ${CHALLENGER_SHADOW_HOURS:-48}
+      CHALLENGER_MIN_SHADOW_SAMPLES: ${CHALLENGER_MIN_SHADOW_SAMPLES:-100}
     ports:
       - "127.0.0.1:8008:8000"
     depends_on:
@@ -469,6 +512,177 @@ services:
           memory: 128M
 
   # ─── Monitoring ─────────────────────────────────────────────────────────────
+  quant-engine:
+    build:
+      context: .
+      dockerfile: services/quant-engine/Dockerfile
+    ports:
+      - "8021:8000"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://botbinance:${DB_PASSWORD:-changeme}@postgres:5432/botbinance}
+    depends_on:
+      - postgres
+
+  sentiment-engine:
+    build:
+      context: .
+      dockerfile: services/sentiment-engine/Dockerfile
+    ports:
+      - "8022:8000"
+    environment:
+      CRYPTOPANIC_API_KEY: ${CRYPTOPANIC_API_KEY:-}
+      TELEGRAM_SENTIMENT_BOT_TOKEN: ${TELEGRAM_SENTIMENT_BOT_TOKEN:-}
+      TELEGRAM_SENTIMENT_CHANNELS: ${TELEGRAM_SENTIMENT_CHANNELS:-}
+      TELEGRAM_SENTIMENT_MAX_MESSAGES: ${TELEGRAM_SENTIMENT_MAX_MESSAGES:-50}
+
+  on-chain-engine:
+    build:
+      context: .
+      dockerfile: services/on-chain-engine/Dockerfile
+    ports:
+      - "8020:8000"
+    environment:
+      ONCHAIN_DATA_PROVIDER_URL: ${ONCHAIN_DATA_PROVIDER_URL:-}
+      ONCHAIN_DATA_PROVIDER_API_KEY: ${ONCHAIN_DATA_PROVIDER_API_KEY:-}
+
+  tick-recorder:
+    build:
+      context: .
+      dockerfile: services/tick-recorder/Dockerfile
+    ports:
+      - "8023:8000"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://botbinance:${DB_PASSWORD:-changeme}@postgres:5432/botbinance}
+    depends_on:
+      - postgres
+
+  anomaly-detection:
+    build:
+      context: .
+      dockerfile: services/anomaly-detection/Dockerfile
+    ports:
+      - "8024:8000"
+
+  adaptive-whitelist:
+    build:
+      context: .
+      dockerfile: services/adaptive-whitelist/Dockerfile
+    ports:
+      - "8025:8000"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-botbinance}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-botbinance}
+      WHITELIST_REGIME: ${WHITELIST_REGIME:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  execution-guard:
+    build:
+      context: .
+      dockerfile: services/execution-guard/Dockerfile
+    ports:
+      - "8026:8000"
+
+  execution-quality:
+    build:
+      context: .
+      dockerfile: services/execution-quality/Dockerfile
+    ports:
+      - "8027:8000"
+
+  capital-allocation:
+    build:
+      context: .
+      dockerfile: services/capital-allocation/Dockerfile
+    ports:
+      - "8028:8000"
+
+  performance-attribution:
+    build:
+      context: .
+      dockerfile: services/performance-attribution/Dockerfile
+    ports:
+      - "8029:8000"
+    depends_on:
+      - postgres
+
+  position-monitor:
+    build:
+      context: .
+      dockerfile: services/position-monitor/Dockerfile
+    ports:
+      - "8030:8000"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-botbinance}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-botbinance}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  news-alpha:
+    build:
+      context: .
+      dockerfile: services/news-alpha/Dockerfile
+    ports:
+      - "8031:8000"
+    environment:
+      NEWS_LLM_ENABLED: ${NEWS_LLM_ENABLED:-false}
+      NEWS_LLM_URL: ${NEWS_LLM_URL:-http://ollama:11434/api/generate}
+      NEWS_LLM_MODEL: ${NEWS_LLM_MODEL:-qwen2.5:1.5b}
+      NEWS_LLM_TIMEOUT_SECONDS: ${NEWS_LLM_TIMEOUT_SECONDS:-2.5}
+
+  post-exit-regret:
+    build:
+      context: .
+      dockerfile: services/post-exit-regret/Dockerfile
+    ports:
+      - "8032:8000"
+
+  post-exit-regret-worker:
+    build:
+      context: .
+      dockerfile: services/post-exit-regret/Dockerfile
+    command: ["python", "/app/post_exit_regret_worker.py"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://botbinance:${DB_PASSWORD:-changeme}@postgres:5432/botbinance}
+      REGRET_WORKER_INTERVAL_SECONDS: ${REGRET_WORKER_INTERVAL_SECONDS:-300}
+    depends_on:
+      - postgres
+
+  telegram-control:
+    build:
+      context: .
+      dockerfile: services/telegram-control/Dockerfile
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_CONTROL_ENABLED: ${TELEGRAM_CONTROL_ENABLED:-false}
+      RISK_GATEWAY_URL: http://risk-gateway:8000
+      KILL_SWITCH_PIN: ${KILL_SWITCH_PIN:-CONFIRM-KILL}
+    depends_on:
+      - risk-gateway
+
+  orderbook-intelligence:
+    build:
+      context: .
+      dockerfile: services/orderbook-intelligence/Dockerfile
+    ports:
+      - "8033:8000"
+
+  predictive-layer:
+    build:
+      context: .
+      dockerfile: services/predictive-layer/Dockerfile
+    ports:
+      - "8034:8000"
+
   prometheus:
     image: prom/prometheus:v2.53.0
     command:

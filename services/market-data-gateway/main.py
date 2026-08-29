@@ -1,6 +1,8 @@
 import asyncio
 import json
+import math
 import os
+from statistics import mean, pstdev
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -94,6 +96,8 @@ class MarketDataGateway:
         self.ws_connections: dict[str, Any] = {}
         self._running = False
         self._candle_buffers: dict[str, list] = {}
+        self._return_history: dict[str, list[float]] = {}
+        self._last_candle_close: dict[str, float] = {}
         self._last_snapshots: dict[str, dict] = {}
         self.obi_monitor = OrderBookMonitor(
             pairs=ALL_SYMBOLS,
@@ -112,6 +116,11 @@ class MarketDataGateway:
             await message_bus.connect()
             await init_db()
             logger.info("Starting Market Data Gateway", symbols_count=len(ALL_SYMBOLS))
+            # These monitors are independent background loops.  Starting the
+            # gateway without them silently disabled the order-book and
+            # liquidation signals advertised by this service.
+            await self.obi_monitor.start()
+            await self.liq_monitor.start()
             # REST polling (fallback for blocked WebSocket)
             asyncio.create_task(self._rest_polling_loop())
             asyncio.create_task(self._persist_candles_loop())
@@ -231,7 +240,29 @@ class MarketDataGateway:
             await self._handle_ticker(stream.split("@")[0], message_data)
 
     async def _handle_ticker(self, symbol: str, item: dict):
-        pass
+        normalized_pair = _normalize_pair(symbol)
+        last_price = float(item.get("c", item.get("lastPrice", 0)) or 0)
+        bid_price = float(item.get("b", item.get("bidPrice", 0)) or 0)
+        ask_price = float(item.get("a", item.get("askPrice", 0)) or 0)
+        if last_price <= 0:
+            return
+        self._last_snapshots[symbol.upper().replace("/", "").replace(":", "")] = {
+            "pair": normalized_pair,
+            "timestamp": datetime.utcnow(),
+            "last_price": last_price,
+            "volume_24h": float(item.get("q", item.get("quoteVolume", 0)) or 0),
+            "mark_price": last_price,
+            "index_price": last_price,
+            "bid_price": bid_price,
+            "ask_price": ask_price,
+            "bid_size": float(item.get("B", 0) or 0),
+            "ask_size": float(item.get("A", 0) or 0),
+            "spread": max(ask_price - bid_price, 0.0),
+            "funding_rate": 0.0,
+            "open_interest": 0.0,
+            "source": "binance_ws",
+        }
+        await self._touch_market_freshness(normalized_pair)
 
     async def _handle_candle(self, item: dict, tf: str):
         k = item.get("k", {})
@@ -249,11 +280,50 @@ class MarketDataGateway:
             "close": Decimal(str(k.get("c", "0"))),
             "volume": Decimal(str(k.get("v", "0"))),
         }
-        key = f"{normalized_pair}:{candle['timeframe']}"
+        values = [float(candle[field]) for field in ("open", "high", "low", "close", "volume")]
+        invalid_ohlc = (
+            not all(math.isfinite(value) for value in values)
+            or candle["high"] < max(candle["open"], candle["close"], candle["low"])
+            or candle["low"] > min(candle["open"], candle["close"], candle["high"])
+            or candle["volume"] < 0
+        )
+        if invalid_ohlc:
+            logger.warning("Rejected anomalous candle", pair=normalized_pair, timeframe=tf)
+            await self._publish_anomaly(normalized_pair, tf, candle["timestamp"], ["invalid_ohlc_or_volume"])
+            return
+        history = self._return_history.setdefault(key := f"{normalized_pair}:{candle['timeframe']}", [])
+        previous_close = self._last_candle_close.get(key)
+        if previous_close and previous_close > 0:
+            current_close = float(candle["close"])
+            current_return = current_close / previous_close - 1.0
+            sigma = pstdev(history) if len(history) > 1 else 0.0
+            z = abs(current_return - mean(history)) / sigma if sigma > 1e-9 else 0.0
+            if abs(current_return) >= 0.20 or (len(history) >= 10 and z > 4.0):
+                logger.warning("Rejected price anomaly", pair=normalized_pair, timeframe=tf,
+                               return_pct=current_return, zscore=z)
+                await self._publish_anomaly(normalized_pair, tf, candle["timestamp"],
+                                            ["price_gap_extreme" if abs(current_return) >= .20 else "return_gt_4_sigma"],
+                                            {"return": current_return, "zscore": z})
+                return
+            history.append(current_return)
+            if len(history) > 120:
+                del history[:-120]
+        self._last_candle_close[key] = float(candle["close"])
         if key not in self._candle_buffers:
             self._candle_buffers[key] = []
         self._candle_buffers[key].append(candle)
         await self._touch_market_freshness(normalized_pair)
+
+    async def _publish_anomaly(self, pair: str, timeframe: str, timestamp: datetime,
+                               reasons: list[str], details: dict | None = None) -> None:
+        try:
+            await message_bus.publish(Channels.MARKET_ANOMALY, {
+                "pair": pair, "timeframe": timeframe, "timestamp": timestamp.isoformat(),
+                "reasons": reasons, "severity": "high", "source": "market-data-gateway",
+                "details": details or {},
+            })
+        except Exception as exc:
+            logger.debug("Could not publish candle anomaly: %s", exc)
 
     async def _persist_candles_loop(self):
         while self._running:
@@ -264,6 +334,7 @@ class MarketDataGateway:
         if not self._candle_buffers:
             return
         async with AsyncSessionLocal() as db:
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
             for key, candles in list(self._candle_buffers.items()):
                 if not candles:
                     continue
@@ -277,17 +348,17 @@ class MarketDataGateway:
                 if not unique_candles:
                     self._candle_buffers[key] = []
                     continue
-                db_objects = [
-                    MarketCandle(
-                        pair=c["pair"], timeframe=c["timeframe"],
-                        timestamp=c["timestamp"].replace(tzinfo=None) if c["timestamp"].tzinfo else c["timestamp"],
-                        open=c["open"], high=c["high"], low=c["low"], close=c["close"], volume=c["volume"],
-                        source="binance"
-                    )
-                    for c in unique_candles
-                ]
                 try:
-                    db.add_all(db_objects)
+                    rows = [{
+                        "pair": c["pair"], "timeframe": c["timeframe"],
+                        "timestamp": c["timestamp"].replace(tzinfo=None) if c["timestamp"].tzinfo else c["timestamp"],
+                        "open": c["open"], "high": c["high"], "low": c["low"],
+                        "close": c["close"], "volume": c["volume"], "source": "binance",
+                    } for c in unique_candles]
+                    stmt = pg_insert(MarketCandle).values(rows).on_conflict_do_nothing(
+                        constraint="uq_market_candles_pair_tf_ts"
+                    )
+                    await db.execute(stmt)
                     await db.commit()
                     logger.info(f"Persisted {len(unique_candles)} candles for {key}")
                 except Exception as e:
@@ -414,6 +485,8 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     gateway._running = False
+    await gateway.obi_monitor.stop()
+    await gateway.liq_monitor.stop()
     await close_db()
 
 

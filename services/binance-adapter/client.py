@@ -60,6 +60,7 @@ class BinanceFuturesClient:
         self.session: aiohttp.ClientSession = None  # lazy init in start()
         self.rate_limiter = RateLimiter()
         self.ws: Any | None = None
+        self.rate_limit_usage: dict[str, int] = {}
 
     async def start(self):
         if self.session and not self.session.closed:
@@ -128,6 +129,13 @@ class BinanceFuturesClient:
             method, url, params=params, data=payload, headers=headers,
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
+            self.rate_limit_usage = {
+                key: int(value) for key, value in {
+                    "used_weight_1m": resp.headers.get("x-mbx-used-weight-1m", 0),
+                    "order_count_10s": resp.headers.get("x-mbx-order-count-10s", 0),
+                    "order_count_1m": resp.headers.get("x-mbx-order-count-1m", 0),
+                }.items()
+            }
             text = await resp.text()
             if resp.status >= 400:
                 try:
@@ -141,6 +149,9 @@ class BinanceFuturesClient:
             # Binance market endpoints may wrap in {"code":..,"msg":..,"data":..}? No —
             # fapi returns plain arrays/objects; error codes come with HTTP 400.
             return result
+
+    def get_rate_limit_status(self) -> dict[str, int]:
+        return dict(self.rate_limit_usage)
 
     # ------------------------------------------------------------------
     # Public market data
@@ -289,6 +300,7 @@ class BinanceFuturesClient:
         side: str,
         quantity: float,
         price: float,
+        client_order_id: str | None = None,
     ) -> dict:
         """Post-Only Limit Maker order (timeInForce=GTX). Fee savings ~60%."""
         params: dict[str, Any] = {
@@ -299,6 +311,8 @@ class BinanceFuturesClient:
             "quantity": str(quantity),
             "price": str(price),
         }
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
         return await self._request("POST", "/fapi/v1/order", params=params, signed=True)
 
     async def place_market_order(
@@ -306,6 +320,7 @@ class BinanceFuturesClient:
         symbol: str,
         side: str,
         quantity: float,
+        client_order_id: str | None = None,
     ) -> dict:
         """Market order (taker) — fallback when limit chasing times out."""
         params: dict[str, Any] = {
@@ -314,6 +329,8 @@ class BinanceFuturesClient:
             "type": "MARKET",
             "quantity": str(quantity),
         }
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
         return await self._request("POST", "/fapi/v1/order", params=params, signed=True)
 
     async def get_order(self, pair: str, order_id: str) -> dict:

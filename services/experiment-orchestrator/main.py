@@ -7,17 +7,19 @@ Menerima proposal dari Policy Gate dan mengkoordinasikan seluruh pipeline penguj
 import asyncio
 import os
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
 import uvicorn
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from orchestrator import ExperimentOrchestrator
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from sqlalchemy import select
 from runner import ExperimentRunner
 
 from shared.db.session import AsyncSessionLocal, close_db, init_db
+from shared.db.models import ModelShadowEvaluation
 from shared.messaging import Channels, MessageBus
 from shared.schemas import HealthCheck
 from shared.security import load_secrets_into_env
@@ -54,9 +56,17 @@ class DeployStrategyRequest(BaseModel):
     environment: str = "demo"
 
 
+class ShadowEvaluationRequest(BaseModel):
+    candidate_score: float | None = None
+    champion_score: float | None = None
+    samples: int = 0
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
 AUTO_ACCEPT_PROPOSALS = os.getenv("AUTO_ACCEPT_PROPOSALS", "true").lower() == "true"
 EXPERIMENT_ORCHESTRATOR_URL = os.getenv("EXPERIMENT_ORCHESTRATOR_URL", "http://experiment-orchestrator:8000")
 AUTO_DEPLOY_ON_START = os.getenv("AUTO_DEPLOY_ON_START", "true").lower() == "true"
+AUTO_PROMOTE_CHALLENGER = os.getenv("AUTO_PROMOTE_CHALLENGER", "false").lower() == "true"
 DEFAULT_STRATEGY = os.getenv("STRATEGY_NAME", "AITradingStrategy")
 
 
@@ -141,9 +151,6 @@ async def _handle_model_candidate(payload: dict[str, Any]) -> None:
     4. Jika lolos: POST /models/promote → publish MODEL_DEPLOYED
     5. Jika gagal: POST /models/reject → publish MODEL_REJECTED
     """
-    import urllib.request
-    import json as _json
-
     version_id = payload.get("version_id")
     if not version_id:
         logger.warning("MODEL_CANDIDATE_READY without version_id — skipping")
@@ -151,54 +158,11 @@ async def _handle_model_candidate(payload: dict[str, Any]) -> None:
 
     logger.info("MODEL_CANDIDATE_READY received: %s", version_id)
 
-    mi_url = os.getenv("MODEL_INFERENCE_URL", "http://model-inference:8000")
-
-    try:
-        # 1. Evaluate candidate vs production
-        req = urllib.request.Request(f"{mi_url}/models/evaluate_candidate", method="POST")
-        eval_result = _json.loads(urllib.request.urlopen(req, timeout=30).read().decode())
-        logger.info("Candidate eval: %s", eval_result)
-
-        # 2. Decision gate — kriteria numeric promote
-        # Best-effort: jika candidate loaded dan production TIDAK → auto-promote
-        cand = eval_result.get("candidate", {})
-        prod = eval_result.get("production", {})
-
-        if not cand.get("loaded"):
-            logger.warning("Candidate model not loadable — rejecting: %s", cand.get("error"))
-            await _reject_model(version_id, mi_url, "candidate_not_loadable")
-            return
-
-        # Jika production belum ada → promote langsung (first model)
-        if not prod.get("loaded"):
-            logger.info("No production model — auto-promote first candidate: %s", version_id)
-            await _promote_model(version_id, mi_url)
-            return
-
-        # 3. Kriteria promote (dari PASS_THRESHOLDS existing + custom ML gate)
-        # Karena dataset holdout mungkin terlalu kecil di early stage,
-        # gunakan kriteria sederhana di sini → upgrade nanti saat data cukup.
-        holdout_size = eval_result.get("dataset", {}).get("holdout_size", 0)
-        if holdout_size < 10:
-            logger.info("Holdout too small (%d) — manual promote required via POST /models/promote", holdout_size)
-            await message_bus.publish(Channels.MODEL_REJECTED, {
-                "version_id": version_id,
-                "reason": f"holdout_too_small:{holdout_size}",
-            })
-            return
-
-        # 4. Promote via REST (backup + swap + DB update)
-        await _promote_model(version_id, mi_url)
-
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Model candidate gate failed: %s", exc, exc_info=True)
-        try:
-            await message_bus.publish(Channels.MODEL_REJECTED, {
-                "version_id": version_id,
-                "reason": f"gate_error:{str(exc)[:200]}",
-            })
-        except Exception:
-            pass
+    # Every candidate first enters the durable 48-hour shadow window. Never
+    # promote directly from the retraining event.
+    await _start_shadow_evaluation(version_id, payload)
+    logger.info("Challenger %s held for shadow review", version_id)
+    return
 
 
 async def _promote_model(version_id: str, mi_url: str) -> None:
@@ -232,6 +196,24 @@ async def _reject_model(version_id: str, mi_url: str, reason: str) -> None:
         "version_id": version_id,
         "reason": reason,
     })
+
+
+async def _start_shadow_evaluation(version_id: str, payload: dict[str, Any]) -> None:
+    """Create the durable 48-hour challenger shadow window."""
+    async with AsyncSessionLocal() as db:
+        existing = await db.execute(
+            select(ModelShadowEvaluation).where(ModelShadowEvaluation.version_id == version_id)
+        )
+        if existing.scalar_one_or_none():
+            return
+        now = datetime.now(UTC).replace(tzinfo=None)
+        db.add(ModelShadowEvaluation(
+            version_id=version_id, started_at=now,
+            ends_at=now + timedelta(hours=float(os.getenv("CHALLENGER_SHADOW_HOURS", "48"))),
+            candidate_score=None, champion_score=None, samples=0, status="running",
+            details={"candidate_payload": payload},
+        ))
+        await db.commit()
 
 
 async def _handle_alert(payload: dict[str, Any]) -> None:
@@ -363,6 +345,45 @@ async def health():
         checks={"message_bus": message_bus.connected},
         timestamp=datetime.now(UTC),
     ).model_dump()
+
+
+@app.post("/models/{version_id}/shadow", response_model=dict[str, Any])
+async def update_shadow(version_id: str, req: ShadowEvaluationRequest):
+    """Record challenger-vs-champion shadow metrics and settle after the window."""
+    async with AsyncSessionLocal() as db:
+        row = (await db.execute(select(ModelShadowEvaluation).where(
+            ModelShadowEvaluation.version_id == version_id))).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Shadow evaluation not found")
+        if row.status != "running":
+            return {"version_id": version_id, "status": row.status}
+        if req.candidate_score is not None: row.candidate_score = req.candidate_score
+        if req.champion_score is not None: row.champion_score = req.champion_score
+        row.samples = max(row.samples, req.samples)
+        row.details = {**(row.details or {}), **req.details}
+        now = datetime.now(UTC).replace(tzinfo=None)
+        min_samples = int(os.getenv("CHALLENGER_MIN_SHADOW_SAMPLES", "100"))
+        min_improvement = float(os.getenv("CHALLENGER_MIN_IMPROVEMENT", ".01"))
+        min_accuracy = float(os.getenv("CHALLENGER_MIN_ACCURACY", ".55"))
+        ready = now >= row.ends_at and row.samples >= min_samples
+        if not ready:
+            await db.commit()
+            return {"version_id": version_id, "status": "running", "ends_at": row.ends_at.isoformat(), "samples": row.samples}
+        if row.candidate_score is None or row.champion_score is None:
+            await db.commit()
+            return {"version_id": version_id, "status": "needs_metrics"}
+        wins = (row.candidate_score >= min_accuracy and
+                row.candidate_score >= row.champion_score + min_improvement)
+        row.status = "passed" if wins else "failed"
+        if wins and not AUTO_PROMOTE_CHALLENGER:
+            row.status = "review_required"
+        await db.commit()
+    mi_url = os.getenv("MODEL_INFERENCE_URL", "http://model-inference:8000")
+    if wins and AUTO_PROMOTE_CHALLENGER:
+        await _promote_model(version_id, mi_url)
+    elif not wins:
+        await _reject_model(version_id, mi_url, "challenger_did_not_win_shadow")
+    return {"version_id": version_id, "status": row.status, "promoted": wins and AUTO_PROMOTE_CHALLENGER}
 
 
 @app.post("/experiments", response_model=dict[str, Any])

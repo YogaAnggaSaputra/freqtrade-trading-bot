@@ -38,6 +38,7 @@ class Channels(str, Enum):
     ALERT = "alert"
     ORDERBOOK_OBI = "orderbook:obi"   # Real-time Order Book Imbalance signals
     REGIME_UPDATE = "regime:update"   # Market regime classification updates
+    MARKET_ANOMALY = "market:anomaly"  # Invalid/stale/abnormal market observations
 
     # ── Feedback loop pipeline (Fase 1+) ──────────────────────────────
     TRADE_CLOSED = "trade:closed"

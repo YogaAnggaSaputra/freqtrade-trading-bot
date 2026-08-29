@@ -470,3 +470,47 @@ class RetrainJob(Base):
     status = Column(String(16), nullable=False, default="running")  # running/completed/failed
     completed_at = Column(DateTime, nullable=True)
     resulting_model_version_id = Column(String(64), ForeignKey("model_versions.version_id"), nullable=True)
+
+
+class ModelShadowEvaluation(Base):
+    __tablename__ = "model_shadow_evaluations"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    version_id = Column(String(64), ForeignKey("model_versions.version_id"), nullable=False, unique=True)
+    started_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    ends_at = Column(DateTime, nullable=False)
+    candidate_score = Column(Numeric(12, 8), nullable=True)
+    champion_score = Column(Numeric(12, 8), nullable=True)
+    samples = Column(BigInteger, nullable=False, default=0)
+    status = Column(String(16), nullable=False, default="running")
+    details = Column(JSON, nullable=False)
+
+
+class PositionHealthSnapshot(Base):
+    __tablename__ = "position_health_snapshots"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    trade_id = Column(String(64), nullable=False, index=True)
+    pair = Column(String(32), nullable=False)
+    timestamp = Column(DateTime, nullable=False, default=datetime.utcnow)
+    health_score = Column(Numeric(8, 4), nullable=False)
+    thesis_valid = Column(Boolean, nullable=False)
+    momentum_decay = Column(Numeric(8, 6), nullable=False)
+    regime = Column(String(64), nullable=True)
+    details = Column(JSON, nullable=False)
+
+    __table_args__ = (Index("ix_position_health_pair_ts", "pair", "timestamp"),)
+
+
+class ExitRegret(Base):
+    __tablename__ = "exit_regrets"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    trade_id = Column(String(64), nullable=False, unique=True, index=True)
+    pair = Column(String(32), nullable=False)
+    exit_price = Column(Numeric(20, 8), nullable=False)
+    best_future_price = Column(Numeric(20, 8), nullable=True)
+    regret_pct = Column(Numeric(12, 8), nullable=False)
+    classification = Column(String(32), nullable=False)
+    horizon_candles = Column(Integer, nullable=False, default=20)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)

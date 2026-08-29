@@ -266,8 +266,8 @@ class ExperimentRunner:
             logger.error("Command timed out after %ds: %s", timeout, cmd[0])
             return False, "", "Timeout"
         except FileNotFoundError:
-            logger.warning("freqtrade not found, returning mock metrics")
-            return True, self._mock_backtest_output(), ""
+            logger.error("freqtrade executable not found; refusing to fabricate backtest metrics")
+            return False, "", "freqtrade executable not found"
         except Exception as e:  # noqa: BLE001
             logger.error("Command failed: %s", e)
             return False, "", str(e)

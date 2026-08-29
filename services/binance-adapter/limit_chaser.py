@@ -81,10 +81,12 @@ class ChaserResult:
 class BinanceClient(Protocol):
     """Protocol defining the expected interface of the Binance client."""
     async def place_limit_maker_order(
-        self, symbol: str, side: str, quantity: float, price: float
+        self, symbol: str, side: str, quantity: float, price: float,
+        client_order_id: str | None = None,
     ) -> dict[str, Any]: ...
     async def place_market_order(
-        self, symbol: str, side: str, quantity: float
+        self, symbol: str, side: str, quantity: float,
+        client_order_id: str | None = None,
     ) -> dict[str, Any]: ...
     async def get_order(self, pair: str, order_id: str) -> dict[str, Any]: ...
     async def cancel_order(self, pair: str, order_id: str) -> None: ...
@@ -117,6 +119,8 @@ class LimitChaser:
         regime: str | None = None,
         adx: float | None = None,
         mode: OrderExecutionMode = OrderExecutionMode.AUTO,
+        client_order_id: str | None = None,
+        trade_id: str = "",
     ) -> ChaserResult:
         """
         Eksekusi order dengan strategi optimal (limit maker atau market).
@@ -134,17 +138,53 @@ class LimitChaser:
         start_ts = time.time()
 
         if not LIMIT_CHASER_ENABLED or mode == OrderExecutionMode.MARKET:
-            return await self._execute_market(pair, side, quantity, intended_price, start_ts)
-
-        # Tentukan apakah kondisi cocok untuk limit maker
-        use_limit = self._should_use_limit_maker(regime=regime, adx=adx)
-
-        if use_limit or mode == OrderExecutionMode.LIMIT:
-            return await self._execute_limit_with_chasing(
-                pair, side, quantity, intended_price, tick_size, start_ts
+            result = await self._execute_market(
+                pair, side, quantity, intended_price, start_ts,
+                client_order_id=client_order_id,
             )
         else:
-            return await self._execute_market(pair, side, quantity, intended_price, start_ts)
+            # Tentukan apakah kondisi cocok untuk limit maker
+            use_limit = self._should_use_limit_maker(regime=regime, adx=adx)
+            if use_limit or mode == OrderExecutionMode.LIMIT:
+                result = await self._execute_limit_with_chasing(
+                    pair, side, quantity, intended_price, tick_size, start_ts,
+                    client_order_id=client_order_id,
+                )
+            else:
+                result = await self._execute_market(
+                    pair, side, quantity, intended_price, start_ts,
+                    client_order_id=client_order_id,
+                )
+
+        await self._record_profile(
+            trade_id=trade_id, pair=pair, side=side, intended_price=intended_price,
+            quantity=quantity, result=result,
+        )
+        return result
+
+    async def _record_profile(self, *, trade_id: str, pair: str, side: str,
+                              intended_price: float, quantity: float,
+                              result: ChaserResult) -> None:
+        if not self._profiler or not result.success or result.executed_price is None:
+            return
+        try:
+            await self._profiler.record_execution(
+                trade_id=trade_id or "unknown",
+                pair=pair,
+                side=side,
+                intended_price=intended_price,
+                executed_price=float(result.executed_price),
+                quantity=quantity,
+                execution_mode=result.execution_mode,
+                fill_type=result.fill_type,
+                signal_to_submit_ms=0.0,
+                submit_to_ack_ms=0.0,
+                ack_to_fill_ms=float(result.time_to_fill_ms or 0.0),
+                repeg_count=result.repeg_count,
+                fee_savings_usdt=float(result.fee_savings_estimate_usdt or 0.0),
+            )
+        except Exception as exc:
+            logger.warning("Execution profiler update failed: %s", exc)
 
     def _should_use_limit_maker(
         self,
@@ -180,6 +220,7 @@ class LimitChaser:
         intended_price: float,
         tick_size: float,
         start_ts: float,
+        client_order_id: str | None = None,
     ) -> ChaserResult:
         """Kirim limit maker order dan chase harga jika tidak filled."""
         if self._client is None:
@@ -206,6 +247,7 @@ class LimitChaser:
                     side=side,
                     quantity=quantity,
                     price=current_price,
+                    client_order_id=client_order_id,
                 )
                 order_id = order_resp.get("orderId")
                 logger.info(
@@ -246,7 +288,10 @@ class LimitChaser:
             with contextlib.suppress(Exception):
                 await self._cancel_order(pair, order_id)
 
-        return await self._execute_market(pair, side, quantity, intended_price, start_ts, repeg_count=repeg_count)
+        return await self._execute_market(
+            pair, side, quantity, intended_price, start_ts,
+            repeg_count=repeg_count, client_order_id=client_order_id,
+        )
 
     async def _execute_market(
         self,
@@ -256,6 +301,7 @@ class LimitChaser:
         intended_price: float,
         start_ts: float,
         repeg_count: int = 0,
+        client_order_id: str | None = None,
     ) -> ChaserResult:
         """Eksekusi market order langsung."""
         if self._client is None:
@@ -269,6 +315,7 @@ class LimitChaser:
                 symbol=pair,
                 side=side,
                 quantity=quantity,
+                client_order_id=client_order_id,
             )
             time_to_fill_ms = (time.time() - start_ts) * 1000
             fill_price = float(order_resp.get("avgPrice", intended_price) or intended_price)

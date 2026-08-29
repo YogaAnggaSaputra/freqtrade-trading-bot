@@ -89,6 +89,13 @@ class KellySizer:
 
         win_rate, avg_win, avg_loss, trade_count = await KellySizer._fetch_trade_stats()
 
+        # Bayesian Beta-Binomial Updating for conservative win-rate estimation
+        from shared.quant.calibration import beta_posterior
+        n_wins = int(win_rate * trade_count)
+        n_losses = trade_count - n_wins
+        post = beta_posterior(n_wins, n_losses)
+        conservative_win_rate = post["lower_ci_95"]  # Use lower bound of 95% credible interval
+
         # Insufficient data → defensive minimum
         if trade_count < KELLY_MIN_TRADES:
             fallback = float(equity) * KELLY_MIN_PCT
@@ -121,12 +128,12 @@ class KellySizer:
                 reason=f"Win rate {win_rate:.1%} < 35% threshold — defensive minimum size",
             )
 
-        # Hitung Full Kelly
+        # Hitung Full Kelly dengan conservative Bayesian win rate
         if avg_loss == 0:
             full_kelly = 0.0
         else:
             risk_reward = avg_win / avg_loss
-            full_kelly = (win_rate * risk_reward - (1 - win_rate)) / risk_reward
+            full_kelly = (conservative_win_rate * risk_reward - (1 - conservative_win_rate)) / risk_reward
             full_kelly = max(0.0, full_kelly)  # Kelly tidak boleh negatif
 
         # Fractional Kelly

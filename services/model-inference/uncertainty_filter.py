@@ -29,6 +29,8 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+from shared.quant.calibration import platt_apply, expected_calibration_error
+
 logger = logging.getLogger("model_inference.uncertainty_filter")
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -40,12 +42,13 @@ UNCERTAINTY_MAX_ENTROPY     = float(os.getenv("UNCERTAINTY_MAX_ENTROPY", "0.65")
 
 @dataclass
 class UncertaintyResult:
-    """Hasil pengecekan uncertainty filter."""
+    """Hasil pengecekan uncertainty filter dengan probabilitas terkalibrasi."""
     should_trade: bool
     confidence_ok: bool
     std_dev_ok: bool
     entropy_ok: bool
     probability: float
+    calibrated_probability: float
     std_dev: float
     entropy: float
     reason: str
@@ -54,7 +57,7 @@ class UncertaintyResult:
 
 class UncertaintyFilter:
     """
-    Filter trade berdasarkan tingkat kepastian model ML.
+    Filter trade berdasarkan tingkat kepastian model ML dan kalibrasi probabilitas.
     Diintegrasikan ke dalam inference pipeline setelah ensemble prediction.
     """
 
@@ -64,19 +67,15 @@ class UncertaintyFilter:
         std_dev: float = 0.0,
         entropy: float = 0.0,
         ensemble_available: bool = False,
+        platt_model: dict | None = None,
     ) -> UncertaintyResult:
         """
         Cek apakah prediksi cukup pasti untuk dieksekusi.
-
-        Args:
-            probability  : Final probability dari model (0.0–1.0)
-            std_dev      : Std deviation antar base models (0.0–0.5)
-            entropy      : Shannon entropy prediksi (0.0–1.0)
-            ensemble_available: True jika ensemble sudah dilatih
-
-        Returns:
-            UncertaintyResult dengan should_trade=True jika aman untuk trade
+        Jika platt_model diberikan, probability dikalibrasi terlebih dahulu.
         """
+        calibrated_p = platt_apply(probability, platt_model) if platt_model else probability
+        eval_p = calibrated_p
+
         if not UNCERTAINTY_ENABLED:
             return UncertaintyResult(
                 should_trade=True,
@@ -84,6 +83,7 @@ class UncertaintyFilter:
                 std_dev_ok=True,
                 entropy_ok=True,
                 probability=probability,
+                calibrated_probability=eval_p,
                 std_dev=std_dev,
                 entropy=entropy,
                 reason="Uncertainty filter disabled",
@@ -92,18 +92,12 @@ class UncertaintyFilter:
 
         reasons_fail = []
 
-        # ── Check 1: Minimum confidence / probability ──────────────────────────
-        # Probability harus > threshold (untuk Long) atau < 1-threshold (untuk Short)
-        # Kita cek dari "conviction strength": seberapa jauh dari 0.5
-        conviction = abs(probability - 0.5) * 2  # 0.0 (no conviction) → 1.0 (full conviction)
-        confidence_ok = conviction >= (UNCERTAINTY_MIN_CONFIDENCE - 0.5) * 2
-
-        # Simplified: probability > threshold ATAU < (1 - threshold)
-        confidence_ok = (probability >= UNCERTAINTY_MIN_CONFIDENCE) or (probability <= 1 - UNCERTAINTY_MIN_CONFIDENCE)
+        # ── Check 1: Calibrated minimum confidence / probability ──────────────
+        confidence_ok = (eval_p >= UNCERTAINTY_MIN_CONFIDENCE) or (eval_p <= 1 - UNCERTAINTY_MIN_CONFIDENCE)
         if not confidence_ok:
             reasons_fail.append(
-                f"Low confidence: probability={probability:.3f} not meeting "
-                f"threshold ({UNCERTAINTY_MIN_CONFIDENCE:.0%} or {1-UNCERTAINTY_MIN_CONFIDENCE:.0%})"
+                f"Low confidence: calibrated_prob={eval_p:.3f} (raw={probability:.3f}) "
+                f"not meeting threshold ({UNCERTAINTY_MIN_CONFIDENCE:.0%} or {1-UNCERTAINTY_MIN_CONFIDENCE:.0%})"
             )
 
         # ── Check 2: Model disagreement (std_dev) — only if ensemble available ─
@@ -128,18 +122,20 @@ class UncertaintyFilter:
 
         if should_trade:
             reason = (
-                f"Prediction confident: p={probability:.3f}, "
+                f"Prediction confident: cal_p={eval_p:.3f} (raw={probability:.3f}), "
                 f"std={std_dev:.3f}, entropy={entropy:.3f}"
             )
         else:
             reason = "BLOCKED: " + " | ".join(reasons_fail)
 
         details = {
-            "probability": probability,
+            "raw_probability": probability,
+            "calibrated_probability": eval_p,
             "std_dev": std_dev,
             "entropy": entropy,
-            "conviction": abs(probability - 0.5) * 2,
+            "conviction": abs(eval_p - 0.5) * 2,
             "ensemble_available": ensemble_available,
+            "platt_calibrated": platt_model is not None,
             "thresholds": {
                 "min_confidence": UNCERTAINTY_MIN_CONFIDENCE,
                 "max_std_dev": UNCERTAINTY_MAX_STD_DEV,
@@ -153,6 +149,7 @@ class UncertaintyFilter:
             std_dev_ok=std_dev_ok,
             entropy_ok=entropy_ok,
             probability=probability,
+            calibrated_probability=eval_p,
             std_dev=std_dev,
             entropy=entropy,
             reason=reason,

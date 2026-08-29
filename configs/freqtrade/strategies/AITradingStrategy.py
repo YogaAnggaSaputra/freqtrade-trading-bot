@@ -22,6 +22,8 @@
 import logging
 import os
 import time
+import json
+from urllib.request import Request, urlopen
 from datetime import datetime
 from typing import Any, Optional
 
@@ -33,6 +35,9 @@ from freqtrade.optimize.hyperopt import IHyperOptLoss
 from freqtrade.persistence import Trade, CustomDataWrapper
 from freqtrade.strategy import DecimalParameter, IntParameter, IStrategy, informative
 from pandas import DataFrame
+from shared.quant.position import position_health, exit_consensus
+from shared.quant.allocation import exposure_multiplier
+from shared.quant.correlation import pearson, average_correlation
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +58,201 @@ _ML_FAIL_BACKOFF_S = 300                 # 5 menit backoff jika service down
 # Nonaktifkan ML call di backtest (service ML tidak berjalan, dan HTTP call
 # hanya memperlambat). Set true via env untuk force-disable juga.
 ML_DISABLED = os.getenv("ML_DISABLED", "false").lower() == "true"
+QUANT_ENGINE_URL = os.getenv("QUANT_ENGINE_URL", "http://quant-engine:8000")
+QUANT_ENGINE_ENABLED = os.getenv("QUANT_ENGINE_ENABLED", "true").lower() == "true"
+QUANT_FACTOR_SCORE_ENABLED = os.getenv("QUANT_FACTOR_SCORE_ENABLED", "false").lower() == "true"
+_factor_cache: dict[str, dict] = {}
+SENTIMENT_ENGINE_URL = os.getenv("SENTIMENT_ENGINE_URL", "http://sentiment-engine:8000")
+SENTIMENT_ENGINE_ENABLED = os.getenv("SENTIMENT_ENGINE_ENABLED", "false").lower() == "true"
+_sentiment_cache: dict[str, dict] = {}
+NEWS_ALPHA_URL = os.getenv("NEWS_ALPHA_URL", "http://news-alpha:8000")
+NEWS_ALPHA_ENABLED = os.getenv("NEWS_ALPHA_ENABLED", "false").lower() == "true"
+ON_CHAIN_ENGINE_URL = os.getenv("ON_CHAIN_ENGINE_URL", "http://on-chain-engine:8000")
+ON_CHAIN_ENGINE_ENABLED = os.getenv("ON_CHAIN_ENGINE_ENABLED", "false").lower() == "true"
+_onchain_cache: dict[str, dict] = {}
+POSITION_MONITOR_URL = os.getenv("POSITION_MONITOR_URL", "http://position-monitor:8000")
+POSITION_MONITOR_ENABLED = os.getenv("POSITION_MONITOR_ENABLED", "false").lower() == "true"
+_position_report_cache: dict[str, float] = {}
+ORDERBOOK_INTELLIGENCE_URL = os.getenv("ORDERBOOK_INTELLIGENCE_URL", "http://orderbook-intelligence:8000")
+ORDERBOOK_INTELLIGENCE_ENABLED = os.getenv("ORDERBOOK_INTELLIGENCE_ENABLED", "false").lower() == "true"
+_orderbook_intelligence_cache: dict[str, dict] = {}
+
+
+def _quant_params(pair: str, regime: str) -> dict:
+    """Fetch adaptive parameters; local strategy values remain the fallback."""
+    if not QUANT_ENGINE_ENABLED:
+        return {}
+    try:
+        url = f"{QUANT_ENGINE_URL}/params/{pair.replace('/', '%2F')}?regime={regime}"
+        req = Request(url, headers={"Accept": "application/json"})
+        with urlopen(req, timeout=0.35) as response:  # noqa: S310
+            if response.status == 200:
+                payload = json.loads(response.read().decode("utf-8"))
+                return payload if isinstance(payload, dict) else {}
+    except Exception:  # service outage must not crash Freqtrade hook
+        pass
+    return {}
+
+
+def _quant_factor_score(pair: str, side: str, last) -> float | None:
+    """Optionally replace the static confluence score with Quant Engine output."""
+    if not QUANT_ENGINE_ENABLED or not QUANT_FACTOR_SCORE_ENABLED:
+        return None
+    key = f"{pair}:{side}"
+    cached = _factor_cache.get(key)
+    if cached and time.time() - cached.get("ts", 0) < 300:
+        return cached.get("score")
+    direction = 1.0 if side == "long" else -1.0
+
+    def _number(name: str, default: float = 0.0) -> float:
+        try:
+            value = float(last.get(name, default) or default)
+            return value if np.isfinite(value) else default
+        except (TypeError, ValueError):
+            return default
+
+    close = max(abs(_number("close", 1.0)), 1e-9)
+    ema50 = _number("ema50_4h", _number("ema50", close))
+    ema200 = _number("ema200_4h", _number("ema200", close))
+    trend = max(-1.0, min(1.0, ((ema50 - ema200) / max(abs(ema200), 1e-9)) * 20.0 * direction))
+    momentum = max(-1.0, min(1.0, ((_number("rsi_14", 50.0) - 50.0) / 50.0) * direction))
+    mtf = max(-1.0, min(1.0, _number("mtf_alignment", 0.0) * direction))
+    volume = max(-1.0, min(1.0, (_number("volume_ratio", 1.0) - 1.0) / 1.5))
+    vwap = _number("vwap", close)
+    structure = max(-1.0, min(1.0, ((close - vwap) / close) * 20.0 * direction))
+    try:
+        payload = json.dumps({
+            "factors": {"trend": trend, "momentum": momentum, "mtf": mtf,
+                        "volume": volume, "structure": structure},
+            "weights": {"trend": .25, "momentum": .25, "mtf": .25,
+                        "volume": .10, "structure": .15},
+        }).encode()
+        req = Request(f"{QUANT_ENGINE_URL}/factor-score", data=payload,
+                      headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=0.35) as response:  # noqa: S310
+            data = json.loads(response.read().decode("utf-8")) if response.status == 200 else {}
+        score = float(data.get("score"))
+        if np.isfinite(score):
+            _factor_cache[key] = {"ts": time.time(), "score": max(0.0, min(100.0, score))}
+            return _factor_cache[key]["score"]
+    except (TypeError, ValueError, OSError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _news_classify(pair: str, headline: str) -> dict:
+    if not NEWS_ALPHA_ENABLED or not headline:
+        return {}
+    try:
+        payload = json.dumps({"pair": pair, "headline": headline}).encode()
+        req = Request(f"{NEWS_ALPHA_URL}/classify", data=payload,
+                      headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=0.35) as response:  # noqa: S310
+            return json.loads(response.read().decode("utf-8")) if response.status == 200 else {}
+    except Exception:
+        return {}
+
+
+def _sentiment(pair: str) -> dict:
+    """Fetch cached Fear & Greed/news sentiment for synchronous strategy hooks."""
+    if not SENTIMENT_ENGINE_ENABLED:
+        return {}
+    cached = _sentiment_cache.get(pair)
+    if cached and time.time() - cached.get("ts", 0) < 300:
+        return cached.get("data", {})
+    try:
+        symbol = pair.split("/")[0].split(":")[0]
+        req = Request(f"{SENTIMENT_ENGINE_URL}/sentiment/{symbol}",
+                      headers={"Accept": "application/json"})
+        with urlopen(req, timeout=0.35) as response:  # noqa: S310
+            data = json.loads(response.read().decode("utf-8")) if response.status == 200 else {}
+        if isinstance(data, dict):
+            _sentiment_cache[pair] = {"ts": time.time(), "data": data}
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def _onchain_metrics(pair: str) -> dict:
+    if not ON_CHAIN_ENGINE_ENABLED:
+        return {}
+
+
+def _orderbook_intelligence(pair: str, book: dict) -> dict:
+    """Send a normalized DOM snapshot to the optional microstructure service."""
+    if not ORDERBOOK_INTELLIGENCE_ENABLED:
+        return {}
+    try:
+        bids = book.get("bids") or []
+        asks = book.get("asks") or []
+        bid_volume = sum(float(level[1]) for level in bids)
+        ask_volume = sum(float(level[1]) for level in asks)
+        current_level = max(
+            [float(level[1]) for level in bids + asks if len(level) > 1] or [0.0]
+        )
+        previous = _orderbook_intelligence_cache.get(pair, {})
+        payload = json.dumps({
+            "bid_volume": bid_volume, "ask_volume": ask_volume,
+            "previous_level_size": float(previous.get("level", current_level)),
+            "current_level_size": current_level,
+            # Trade-flow/refill fields become meaningful when tick-recorder
+            # data is supplied by a future caller; zero is an honest default.
+            "buy_volume": 0.0, "sell_volume": 0.0,
+            "traded_size": 0.0, "refill_count": 0,
+            "displayed_size": current_level, "executed_size": 0.0,
+        }).encode()
+        _orderbook_intelligence_cache[pair] = {"level": current_level, "ts": time.time()}
+        req = Request(f"{ORDERBOOK_INTELLIGENCE_URL}/analyze", data=payload,
+                      headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=0.25) as response:  # noqa: S310
+            result = json.loads(response.read().decode("utf-8")) if response.status == 200 else {}
+        return result if isinstance(result, dict) else {}
+    except Exception:
+        return {}
+    cached = _onchain_cache.get(pair)
+    if cached and time.time() - cached.get("ts", 0) < 30:
+        return cached.get("data", {})
+    try:
+        req = Request(f"{ON_CHAIN_ENGINE_URL}/metrics/{pair.replace('/', '')}",
+                      headers={"Accept": "application/json"})
+        with urlopen(req, timeout=0.35) as response:  # noqa: S310
+            data = json.loads(response.read().decode("utf-8")) if response.status == 200 else {}
+        _onchain_cache[pair] = {"ts": time.time(), "data": data}
+        return data
+    except Exception:
+        return {}
+
+
+def _record_position_health(pair: str, trade, health: dict, regime: str,
+                            current_r: float, peak_r: float, mtf_alignment: float,
+                            funding: float = 0.0) -> None:
+    """Persist lightweight position telemetry without blocking every candle."""
+    if not POSITION_MONITOR_ENABLED or not getattr(trade, "id", None):
+        return
+    key = str(trade.id)
+    now = time.time()
+    if now - _position_report_cache.get(key, 0.0) < 60:
+        return
+    _position_report_cache[key] = now
+    try:
+        payload = json.dumps({
+            "trade_id": key, "pair": pair, "regime": regime,
+            "regime_at_entry": getattr(trade, "entry_regime", None) or
+                               (getattr(trade, "fb_entry", {}) or {}).get("regime"),
+            "current_r": float(current_r), "peak_r": max(0.0, float(peak_r)),
+            "mtf_alignment": float(mtf_alignment),
+            "notional": float(getattr(trade, "stake_amount", 0) or 0),
+            "funding_rate": funding,
+            "expected_profit": max(float(current_r), 0.0) * float(getattr(trade, "stake_amount", 0) or 0),
+        }).encode()
+        req = Request(f"{POSITION_MONITOR_URL}/assess", data=payload,
+                      headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=0.25):  # noqa: S310
+            pass
+    except Exception:
+        # Telemetry outage must never alter an exit decision.
+        return
 
 
 def _ml_enabled(self) -> bool:
@@ -737,6 +937,16 @@ class AITradingStrategy(IStrategy):
         # ── [FIX-CRITICAL] Regime — VECTORIZED, no lookahead ──
         dataframe["regime"] = detect_regime_vectorized(dataframe)
 
+        # Multi-timeframe momentum alignment used by open-position health.
+        mtf_parts = []
+        if "ema13_15m" in dataframe:
+            mtf_parts.append(np.where(dataframe["close"] >= dataframe["ema13_15m"], 1.0, -1.0))
+        if "ema50_1h" in dataframe:
+            mtf_parts.append(np.where(dataframe["close"] >= dataframe["ema50_1h"], 1.0, -1.0))
+        if "ema50_4h" in dataframe:
+            mtf_parts.append(np.where(dataframe["close"] >= dataframe["ema50_4h"], 1.0, -1.0))
+        dataframe["mtf_alignment"] = np.nanmean(np.vstack(mtf_parts), axis=0) if mtf_parts else 0.0
+
         # ── Kill Zone (Session) — DISABLED: trading 24/7 ──
         dataframe["session_dead"]   = 0
         dataframe["in_killzone"]    = 1
@@ -776,6 +986,19 @@ class AITradingStrategy(IStrategy):
         ml_prob, ml_signal = self._attach_ml_columns(dataframe, pair)
         dataframe["ml_probability"]       = ml_prob
         dataframe["ml_signal_direction"]  = ml_signal
+
+        # A verified, strongly positive headline may justify a breakout that
+        # would otherwise be blocked by the anti-FOMO candle lock. This is
+        # opt-in and only applies to long entries on the current bar.
+        news_override_long = False
+        if NEWS_ALPHA_ENABLED and pair and os.getenv("NEWS_HEADLINE", ""):
+            news = _news_classify(pair, os.getenv("NEWS_HEADLINE", ""))
+            news_override_long = (
+                float(news.get("score", 0.0) or 0.0) >= 0.75 and
+                news.get("event") == "positive_event"
+            )
+            if news_override_long and len(dataframe):
+                dataframe.loc[dataframe.index[-1], "fomo_lock"] = 0
 
         # ML gate: hanya aktif jika ML punya data (bukan NaN).
         # Long butuh ML tidak bearish kuat; Short butuh ML tidak bullish kuat.
@@ -855,6 +1078,44 @@ class AITradingStrategy(IStrategy):
     # Untuk long: return negatif (misal -0.03 = SL 3% di bawah harga saat ini)
     # Untuk short: return positif (misal +0.03 = SL 3% di atas harga saat ini)
     # =========================================================================
+    def _capture_entry_feedback(self, pair: str, trade, dataframe) -> None:
+        """Persist entry features once a filled trade has an id."""
+        if getattr(trade, "fb_entry", None) or not getattr(trade, "id", None) or len(dataframe) < 1:
+            return
+        last = dataframe.iloc[-1]
+        feature_cols = [
+            "ema8", "ema13", "ema21", "ema34", "ema50", "ema89", "ema200",
+            "sma20", "sma50", "sma200", "rsi_14", "rsi_7", "rsi_21",
+            "macd", "macd_signal", "macd_hist", "stoch_k", "stoch_d",
+            "srsi_k", "srsi_d", "cci", "willr", "mfi", "roc", "atr",
+            "atr_pct", "atr_ratio", "bb_width", "bb_pct", "bb_squeeze",
+            "kc_upper", "kc_lower", "don_high", "don_low", "obv_slope",
+            "volume_ratio", "volume_slope", "cmf", "vwma", "adx",
+            "ema50_1d", "ema200_1d", "ema50_4h", "ema200_4h", "adx_1d",
+            "adx_4h", "rsi_4h", "btc_ema50_1h", "btc_rsi_1h", "mtf_alignment",
+        ]
+        features = {
+            name: float(last[name]) for name in feature_cols
+            if name in last.index and isinstance(last[name], (int, float))
+            and not pd.isna(last[name])
+        }
+        features.update({"feature_version": "v1", "candle_count": int(len(dataframe))})
+        regime = str(last.get("regime", "RANGING"))
+        from shared.feedback import snapshot_entry_conditions
+        snapshot_entry_conditions(
+            trade=trade,
+            regime=regime,
+            predicted_rr=float(last.get("predicted_rr", self.tp3_rrr) or self.tp3_rrr),
+            ml_signal=str(last.get("ml_signal_direction", "HOLD")),
+            ml_prob=float(last.get("ml_probability", 0.5) or 0.5),
+            conf=float(last.get("conf_score_short" if trade.is_short else "conf_score_long", 0) or 0),
+            atr_ratio=float(last.get("atr_ratio", 1.0) or 1.0),
+            side="short" if trade.is_short else "long",
+            entry_rate=float(trade.open_rate),
+            features=features,
+        )
+        trade.entry_regime = regime
+
     def custom_stoploss(self, pair: str, trade, current_time: datetime,
                          current_rate: float, current_profit: float,
                          after_fill: bool, **kwargs) -> float:
@@ -867,6 +1128,7 @@ class AITradingStrategy(IStrategy):
         # callback ini (object bisa berbeda), jadi hitung ulang dari candle fill.
         if after_fill and trade.id is not None:
             try:
+                self._capture_entry_feedback(pair, trade, dataframe)
                 last_fill = dataframe.iloc[-1]
                 atr_fill = float(last_fill.get("atr", current_rate * 0.01))
                 sl_dist_fill = max(self.sl_atr_multiplier * atr_fill, current_rate * 0.015)
@@ -892,8 +1154,13 @@ class AITradingStrategy(IStrategy):
                     trade.id, "entry_imbalance",
                     float(self._pending_imbalance["imb"]))
                 self._pending_imbalance = None
+            if getattr(self, "_pending_orderbook", None) and trade.id is not None:
+                CustomDataWrapper.set_custom_data(
+                    trade.id, "entry_orderbook_intelligence",
+                    dict(self._pending_orderbook))
+                self._pending_orderbook = None
         except Exception as exc:
-            logger.debug(f"[{pair}] entry_imbalance persist skipped: {exc}")
+            logger.debug(f"[{pair}] orderbook telemetry persist skipped: {exc}")
 
         # ── ML MAE/MFE dynamic SL (fail-open) ──
         # Jika model-inference punya rekomendasi SL yang lebih ketat/optimal,
@@ -1273,12 +1540,24 @@ class AITradingStrategy(IStrategy):
             return None
 
         r_multiple = current_profit / one_r
+        regime = str(dataframe.iloc[-1].get("regime", "unknown"))
+        adaptive = _quant_params(pair, regime)
+        tp1_rrr = float(adaptive.get("tp1_rrr", self.tp1_rrr))
+        tp2_rrr = float(adaptive.get("tp2_rrr", self.tp2_rrr))
+        atr_ratio = float(dataframe.iloc[-1].get("atr_ratio", 1.0) or 1.0)
+        tp1_close_pct = self.tp1_close_pct
+        tp2_close_pct = self.tp2_close_pct
+        if atr_ratio > 2.0:
+            # Volatility-adjusted partials: realize more earlier when the
+            # chance of a runner reverting is materially higher.
+            tp1_close_pct = min(0.50, tp1_close_pct + 0.10)
+            tp2_close_pct = min(0.45, tp2_close_pct + 0.05)
 
-        # TP1: 1.5R → close 30%
-        if not state["tp1"] and r_multiple >= self.tp1_rrr:
+        # TP1: quant-engine calibrated R level → close adaptive percentage
+        if not state["tp1"] and r_multiple >= tp1_rrr:
             state["tp1"] = True
-            close_stake = trade.stake_amount * self.tp1_close_pct
-            logger.info(f"[{pair}] TP1 hit ({r_multiple:.2f}R) → close {self.tp1_close_pct:.0%}")
+            close_stake = trade.stake_amount * tp1_close_pct
+            logger.info(f"[{pair}] TP1 hit ({r_multiple:.2f}R) → close {tp1_close_pct:.0%}")
             # Persist state biar gak reset kalau restart bot (DB native)
             try:
                 CustomDataWrapper.set_custom_data(trade.id, "tp1_done", True)
@@ -1288,11 +1567,11 @@ class AITradingStrategy(IStrategy):
             return -close_stake
 
 
-        # TP2: 2.5R → close 40%
-        if not state["tp2"] and r_multiple >= self.tp2_rrr:
+        # TP2: quant-engine calibrated R level → close adaptive percentage
+        if not state["tp2"] and r_multiple >= tp2_rrr:
             state["tp2"] = True
-            close_stake = trade.stake_amount * self.tp2_close_pct
-            logger.info(f"[{pair}] TP2 hit ({r_multiple:.2f}R) → close {self.tp2_close_pct:.0%}")
+            close_stake = trade.stake_amount * tp2_close_pct
+            logger.info(f"[{pair}] TP2 hit ({r_multiple:.2f}R) → close {tp2_close_pct:.0%}")
             try:
                 CustomDataWrapper.set_custom_data(trade.id, "tp2_done", True)
             except Exception:
@@ -1334,6 +1613,26 @@ class AITradingStrategy(IStrategy):
         sl_pct = float(sl_pct)
         one_r  = sl_pct
         r_mult = current_profit / one_r if one_r > 0 else 0
+        consensus_enabled = os.getenv("EXIT_CONSENSUS_ENABLED", "false").lower() == "true"
+        health = {"score": 100.0, "momentum_decay": 0.0, "thesis_valid": True}
+        peak_r_mult = max(0.0, r_mult)
+        mtf_alignment = float(last.get("mtf_alignment", 1.0) or 1.0)
+        # Trade-health telemetry is always safe; exit consensus is opt-in until
+        # enough historical calibration exists.
+        try:
+            peak_rate = float(getattr(trade, "min_rate", 0) or 0) if trade.is_short else float(getattr(trade, "max_rate", 0) or 0)
+            peak_profit = ((float(trade.open_rate) - peak_rate) / float(trade.open_rate)
+                           if trade.is_short else
+                           (peak_rate - float(trade.open_rate)) / float(trade.open_rate))
+            peak_r_mult = max(0.0, peak_profit / one_r) if one_r > 0 else r_mult
+            health = position_health(
+                r_mult, peak_r_mult, str(last.get("regime", "unknown")),
+                getattr(trade, "entry_regime", None) or (fb_entry.get("regime") if fb_entry else None),
+                mtf_alignment,
+            )
+            logger.debug("[%s] trade_health=%s", pair, health)
+        except Exception as e:
+            logger.debug("[%s] trade health skipped: %s", pair, e)
 
         # ── [NEW] Real daily P&L circuit breaker ──
         # Hitung total P&L USDT dari semua trade yang ditutup hari ini
@@ -1398,10 +1697,33 @@ class AITradingStrategy(IStrategy):
 
         # ── Regime change exit ──
         regime = last.get("regime", "RANGING")
-        if not trade.is_short and regime == "TRENDING_BEAR":
-            return "regime_change_to_bear"
-        if trade.is_short and regime == "TRENDING_BULL":
-            return "regime_change_to_bull"
+        adaptive_exit = _quant_params(pair, str(regime))
+        tp3_rrr = float(adaptive_exit.get("tp3_rrr", self.tp3_rrr))
+        regime_exit = (not trade.is_short and regime == "TRENDING_BEAR") or (trade.is_short and regime == "TRENDING_BULL")
+        if regime_exit and not consensus_enabled:
+            return "regime_change_to_bear" if not trade.is_short else "regime_change_to_bull"
+        funding_exit = False
+        funding = 0.0
+
+        # Funding cost guard while a position is open. Only charge funding in
+        # the adverse direction for the position side.
+        if os.getenv("POSITION_RISK_ENABLED", "false").lower() == "true":
+            try:
+                funding = float(last.get("funding_rate", 0.0) or 0.0)
+                adverse = (not trade.is_short and funding > 0) or (trade.is_short and funding < 0)
+                periods = max(1, int(hours_open / 8))
+                notional = float(getattr(trade, "stake_amount", 0)) * float(getattr(trade, "leverage", 1) or 1)
+                funding_cost = notional * abs(funding) * periods
+                expected_profit = abs(float(getattr(trade, "stake_amount", 0))) * max(current_profit, 0)
+                if adverse and expected_profit > 0 and funding_cost >= expected_profit * .5:
+                    funding_exit = True
+            except Exception as e:
+                logger.debug("[%s] funding impact skipped: %s", pair, e)
+
+        _record_position_health(
+            pair, trade, health, str(regime), r_mult, peak_r_mult,
+            mtf_alignment, funding,
+        )
 
         # ── Reversal kuat (ADX + volume + dual-candle confirmation) ──
         # [UPDATE 2026-08-26] Filter ganda anti-false-signal di 5m:
@@ -1413,6 +1735,7 @@ class AITradingStrategy(IStrategy):
         adx_now = last.get("adx", 25)
         volume_now = float(last.get("volume_ratio", 1.0) or 1.0)
         prev = dataframe.iloc[-2] if len(dataframe) >= 2 else last
+        reversal_signal = False
 
         if current_profit > 0 and float(adx_now or 0) < 30 and volume_now >= 1.3:
             # Konfirmasi 2 candle: pattern sekarang + 1 candle sebelumnya searah
@@ -1420,12 +1743,30 @@ class AITradingStrategy(IStrategy):
                 cur_signal = (last.get("engulfing", 0) < 0 or last.get("shooting_star", 0) < 0)
                 prev_signal = (prev.get("engulfing", 0) < 0 or prev.get("shooting_star", 0) < 0)
                 if cur_signal and prev_signal:
-                    return "bearish_reversal_exit_long"
+                    reversal_signal = True
             else:
                 cur_signal = (last.get("engulfing", 0) > 0 or last.get("hammer", 0) > 0)
                 prev_signal = (prev.get("engulfing", 0) > 0 or prev.get("hammer", 0) > 0)
                 if cur_signal and prev_signal:
-                    return "bullish_reversal_exit_short"
+                    reversal_signal = True
+
+        if consensus_enabled:
+            signals = {
+                "regime": regime_exit,
+                "ml": bool(getattr(trade, "ml_exit_signal", False)),
+                "momentum": health.get("momentum_decay", 0.0) > 0.35,
+                "reversal": reversal_signal,
+                "volume": volume_now < 0.7,
+                "funding": funding_exit,
+            }
+            should_exit, score = exit_consensus(
+                signals, threshold=float(os.getenv("EXIT_CONSENSUS_THRESHOLD", ".65"))
+            )
+            if should_exit:
+                logger.info("[%s] Exit consensus score %.2f signals=%s", pair, score, signals)
+                return "exit_consensus"
+        elif funding_exit:
+            return "funding_cost_exceed_exit"
 
         # ── Dynamic TP dari ML MAE/MFE ──
         # Jika model merekomendasikan take_profit spesifik (dari data historis),
@@ -1447,7 +1788,7 @@ class AITradingStrategy(IStrategy):
                 pass
 
         # ── TP3 / Full runner exit ──
-        if r_mult >= self.tp3_rrr:
+        if r_mult >= tp3_rrr:
             return "tp3_full_runner_exit"
 
         # ── Dead zone exit dengan profit kecil ──
@@ -1478,6 +1819,18 @@ class AITradingStrategy(IStrategy):
             risk_pct = 0.010
         else:
             risk_pct = 0.010
+
+        if os.getenv("CAPITAL_ALLOCATION_ENABLED", "false").lower() == "true":
+            try:
+                pair_for_alloc = kwargs.get("pair") or ""
+                frame, _ = self.dp.get_analyzed_dataframe(pair_for_alloc, self.timeframe)
+                regime = str(frame.iloc[-1].get("regime", "unknown")) if len(frame) else "unknown"
+                closed = Trade.get_trades([Trade.is_open.is_(False)]).all()
+                pnl = sum(float(t.close_profit_abs or 0) for t in closed)
+                drawdown = max(0.0, -pnl / max(float(total_capital), 1e-9))
+                risk_pct *= exposure_multiplier(drawdown, regime)
+            except Exception as e:
+                logger.debug("Capital allocation skipped: %s", e)
 
         risk_amount = total_capital * risk_pct
 
@@ -1526,6 +1879,15 @@ class AITradingStrategy(IStrategy):
             final_stake = base_stake * vol_mult * conf_mult * streak_mult
         else:
             final_stake = total_capital * risk_pct
+
+        if SENTIMENT_ENGINE_ENABLED:
+            sentiment = _sentiment(pair)
+            if not sentiment.get("stale", True):
+                fear_greed = sentiment.get("fear_greed")
+                if fear_greed is not None and int(fear_greed) <= 20:
+                    final_stake *= 0.50
+                elif fear_greed is not None and int(fear_greed) <= 35:
+                    final_stake *= 0.75
 
         min_s = min_stake if min_stake else 1.0
         final = max(min_s, min(final_stake, max_stake))
@@ -1599,15 +1961,22 @@ class AITradingStrategy(IStrategy):
         conf      = last.get(conf_key, 0)
         atr_ratio = last.get("atr_ratio", 1.0)
         atr       = last.get("atr", rate * 0.01)
-        sl_dist   = self.sl_atr_multiplier * atr
+        regime = str(last.get("regime", "unknown"))
+        factor_score = _quant_factor_score(pair, side, last)
+        if factor_score is not None:
+            conf = factor_score
+        adaptive = _quant_params(pair, regime)
+        confluence_threshold = float(adaptive.get("confluence_threshold", self.min_confluence_score))
+        sl_multiplier = float(adaptive.get("sl_atr_multiplier", self.sl_atr_multiplier))
+        sl_dist   = sl_multiplier * atr
         # Floor SL 0.5% — konsisten dengan custom_stoploss. ATR 5m pair murah
         # bisa sangat kecil, SL terlalu rapat → noise & fee makan RR.
         sl_dist   = max(sl_dist, rate * 0.01)
         sl_pct    = sl_dist / rate
 
         # ── 1. Confluence check ──
-        if conf < self.min_confluence_score:
-            logger.info(f"[{pair}] REJECTED: confluence {conf} < {self.min_confluence_score}")
+        if conf < confluence_threshold:
+            logger.info(f"[{pair}] REJECTED: confluence {conf} < {confluence_threshold}")
             return False
 
         # ── 1b. ML confirmation check (fail-CLOSED) ──
@@ -1634,10 +2003,60 @@ class AITradingStrategy(IStrategy):
             )
             return False
 
+        # News is an additional confidence modifier, never a hard dependency.
+        news = _news_classify(pair, os.getenv("NEWS_HEADLINE", ""))
+        news_score = float(news.get("score", 0.0) or 0.0)
+        if NEWS_ALPHA_ENABLED and ((side == "long" and news_score < -0.75) or
+                                   (side == "short" and news_score > 0.75)):
+            logger.info("[%s] REJECTED: strongly contradictory news score %.2f", pair, news_score)
+            return False
+
+        sentiment = _sentiment(pair)
+        if SENTIMENT_ENGINE_ENABLED and not sentiment.get("stale", True):
+            fear_greed = sentiment.get("fear_greed")
+            sentiment_score = float(sentiment.get("score", 0.0) or 0.0)
+            if fear_greed is not None and int(fear_greed) >= 80:
+                logger.info("[%s] REJECTED: extreme greed Fear & Greed=%s", pair, fear_greed)
+                return False
+            if ((side == "long" and sentiment_score <= -0.35) or
+                    (side == "short" and sentiment_score >= 0.35)):
+                logger.info("[%s] REJECTED: contradictory sentiment score %.2f", pair, sentiment_score)
+                return False
+
+        # Funding/OI is an optional on-chain confirmation. Extreme positive
+        # funding means crowded longs; extreme negative funding crowds shorts.
+        chain = _onchain_metrics(pair)
+        funding = float(chain.get("aggregated_funding_rate", 0.0) or 0.0)
+        oi_delta = float(chain.get("open_interest_delta_pct", 0.0) or 0.0)
+        netflow_signal = chain.get("netflow_signal")
+        if ON_CHAIN_ENGINE_ENABLED and ((side == "long" and funding >= .001) or
+                                        (side == "short" and funding <= -.001)):
+            logger.info("[%s] REJECTED: crowded funding %.5f", pair, funding)
+            return False
+        if ON_CHAIN_ENGINE_ENABLED and abs(oi_delta) >= 0.05 and ((side == "long" and funding > 0) or
+                                                                  (side == "short" and funding < 0)):
+            logger.info("[%s] REJECTED: crowded funding/OI expansion funding=%.5f oi_delta=%.2f%%",
+                        pair, funding, oi_delta * 100)
+            return False
+        if ON_CHAIN_ENGINE_ENABLED and netflow_signal is not None:
+            try:
+                netflow_signal = float(netflow_signal)
+                if ((side == "long" and netflow_signal <= -0.75) or
+                        (side == "short" and netflow_signal >= 0.75)):
+                    logger.info("[%s] REJECTED: contradictory exchange netflow signal %.2f",
+                                pair, netflow_signal)
+                    return False
+            except (TypeError, ValueError):
+                pass
+
         # ── 2. Dead zone & FOMO lock ──
         if last.get("session_dead", 0) == 1:
             return False
-        if last.get("fomo_lock", 0) == 1:
+        positive_news_override = (
+            side == "long" and NEWS_ALPHA_ENABLED and news_score >= 0.75 and
+            news.get("event") == "positive_event"
+        )
+        if last.get("fomo_lock", 0) == 1 and not positive_news_override:
             return False
 
         # ── 3. Extreme volatility ──
@@ -1773,22 +2192,47 @@ class AITradingStrategy(IStrategy):
                 )
                 return False
 
-        # ── 8. Correlation guard ──
-        # Tolak jika sudah ada >= max_correlated_open trade di pair BTC/ETH cluster
+        # ── 8. Computed correlation guard (Supreme Math Edition) ──
+        # Hitung Pearson correlation real-time antara candidate pair dan open positions
         try:
-            btc_cluster = {"BTC", "ETH", "BNB", "SOL", "XRP"}  # Highly correlated majors
-            base_asset = pair.split("/")[0].split(":")[0]
-            if base_asset in btc_cluster:
-                correlated_count = sum(
-                    1 for t in Trade.get_trades([Trade.is_open.is_(True)]).all()
-                    if t.pair.split("/")[0].split(":")[0] in btc_cluster
-                )
-                if correlated_count >= self.max_correlated_open:
-                    logger.info(
-                        f"[{pair}] REJECTED: {correlated_count} correlated positions open "
-                        f"(max {self.max_correlated_open})"
+            open_trades = Trade.get_trades([Trade.is_open.is_(True)]).all()
+            if open_trades:
+                cand_df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+                cand_returns = cand_df["close"].pct_change().dropna().tail(50).tolist() if len(cand_df) >= 20 else []
+
+                high_corr_found = False
+                for t in open_trades:
+                    if t.pair == pair:
+                        continue
+                    t_df, _ = self.dp.get_analyzed_dataframe(t.pair, self.timeframe)
+                    t_returns = t_df["close"].pct_change().dropna().tail(50).tolist() if len(t_df) >= 20 else []
+                    if cand_returns and t_returns:
+                        corr_val = pearson(cand_returns, t_returns)
+                        if corr_val >= 0.85:
+                            logger.info(
+                                f"[{pair}] REJECTED: high computed correlation r={corr_val:.2f} "
+                                f"with open position {t.pair} (max 0.85)"
+                            )
+                            return False
+                    else:
+                        # Fallback ke cluster btc jika data return kurang
+                        btc_cluster = {"BTC", "ETH", "BNB", "SOL", "XRP"}
+                        b_cand = pair.split("/")[0].split(":")[0]
+                        b_open = t.pair.split("/")[0].split(":")[0]
+                        if b_cand in btc_cluster and b_open in btc_cluster:
+                            high_corr_found = True
+
+                if high_corr_found:
+                    correlated_count = sum(
+                        1 for t in open_trades
+                        if t.pair.split("/")[0].split(":")[0] in {"BTC", "ETH", "BNB", "SOL", "XRP"}
                     )
-                    return False
+                    if correlated_count >= self.max_correlated_open:
+                        logger.info(
+                            f"[{pair}] REJECTED: {correlated_count} correlated cluster positions open "
+                            f"(max {self.max_correlated_open})"
+                        )
+                        return False
         except Exception as e:
             logger.debug(f"[{pair}] Correlation check skipped: {e}")
 
@@ -1797,11 +2241,9 @@ class AITradingStrategy(IStrategy):
             f"atr_ratio={atr_ratio:.2f}, fee_adj_rr={estimated_rr:.2f}"
         )
 
-        # ── [ORDERBOOK-PROBE] Passive imbalance metric (TIDAK memblokir entry) ──
-        # I(t) = (B-A)/(B+A). Logging saja untuk korelasi dgn win-rate nanti.
-        # JANGAN return False di sini — ini fase observasi, bukan gate aktif.
-        # TODO: setelah ~10-20 trade, cek korelasi |I(t)| dgn menang → baru
-        #       jadikan gate aktif dgn threshold data-driven.
+        # ── [ORDERBOOK-GATE] Imbalance is an optional data-driven gate ──
+        # I(t) = (B-A)/(B+A). It is always recorded; rejection is controlled
+        # by ORDERBOOK_GATE_ENABLED and the configured threshold.
         try:
             book = self.dp.orderbook(pair, 10)
             if book and book.get("bids") and book.get("asks"):
@@ -1819,50 +2261,19 @@ class AITradingStrategy(IStrategy):
                 # max_open_trades=1 → aman 1 pending aja. ponytail: upgrade ke
                 # dict per-pair kalau max_open_trades>1.
                 self._pending_imbalance = {"imb": float(imb), "ts": str(current_time)}
+                if os.getenv("ORDERBOOK_GATE_ENABLED", "false").lower() == "true" and abs(imb) >= float(os.getenv("ORDERBOOK_GATE_MIN_IMBALANCE", "0.08")) and not side_ok:
+                    logger.info(f"[{pair}] REJECTED: orderbook imbalance contra intent ({imb:+.3f})")
+                    return False
+                intelligence = _orderbook_intelligence(pair, book)
+                if intelligence:
+                    self._pending_orderbook = intelligence
+                    spoofing = float(intelligence.get("spoofing_score", 0.0) or 0.0)
+                    if (os.getenv("ORDERBOOK_GATE_ENABLED", "false").lower() == "true" and
+                            spoofing > float(os.getenv("ORDERBOOK_SPOOFING_MAX", "0.70"))):
+                        logger.info("[%s] REJECTED: orderbook spoofing score %.2f", pair, spoofing)
+                        return False
         except Exception as e:
             logger.debug(f"[{pair}] orderbook probe skipped: {e}")
-
-        # ── 7b. Snapshot entry_conditions untuk feedback loop ─────────────
-        # regime, predicted_rr, dan conf_score akan dipakai loss-analyzer
-        # untuk menghitung signal_correct / drift metric per regime.
-        # [FEATURES] Kumpulkan indikator numerik candle entry → dipakai
-        # retrainer (ensemble/MAE-MFE). Cukup 5m + HTF yang tersedia.
-        try:
-            _FEATURE_COLS = [
-                "ema8", "ema13", "ema21", "ema34", "ema50", "ema89", "ema200",
-                "sma20", "sma50", "sma200", "rsi_14", "rsi_7", "rsi_21",
-                "macd", "macd_signal", "macd_hist", "stoch_k", "stoch_d",
-                "srsi_k", "srsi_d", "cci", "willr", "mfi", "roc", "atr",
-                "atr_pct", "atr_ratio", "bb_width", "bb_pct", "bb_squeeze",
-                "kc_upper", "kc_lower", "don_high", "don_low", "obv_slope",
-                "volume_ratio", "volume_slope", "cmf", "vwma", "adx",
-                "ema50_1d", "ema200_1d", "ema50_4h", "ema200_4h", "adx_1d",
-                "adx_4h", "rsi_4h", "btc_ema50_1h", "btc_rsi_1h",
-            ]
-            entry_features = {}
-            for c in _FEATURE_COLS:
-                if c in last.index:
-                    v = last[c]
-                    if isinstance(v, (int, float)) and not pd.isna(v):
-                        entry_features[c] = float(v)
-            entry_features["feature_version"] = "v1"
-            entry_features["candle_count"] = int(len(dataframe))
-            from shared.feedback import snapshot_entry_conditions
-            snapshot_entry_conditions(
-                trade=trade,
-                regime=str(last.get("regime", "RANGING")),
-                predicted_rr=float(estimated_rr),
-                ml_signal=str(last.get("ml_signal_direction", "HOLD")),
-                ml_prob=float(last.get("ml_probability", 0.5)),
-                conf=float(conf),
-                atr_ratio=float(atr_ratio),
-                side=side,
-                entry_rate=float(rate),
-                sl_pct=float(sl_pct),
-                features=entry_features,
-            )
-        except Exception as e:
-            logger.debug(f"[{pair}] snapshot_entry_conditions skipped: {e}")
 
         # ── 8. Risk Gateway validation (fail-closed) ──
         try:
@@ -1923,15 +2334,6 @@ class AITradingStrategy(IStrategy):
             logger.warning(f"[{pair}] risk-gateway setup error: {e} - FAIL CLOSED")
             return False
 
-        # ── 9. Simpan SL distance (fraksi) ke trade utk R-multiple akurat ──
-        # 1R = jarak entry→SL. Dipakai custom_exit / adjust_trade_position.
-        # ATR live bisa menyusut → r_mult meledak palsu (bug tp3_full_runner_exit).
-        try:
-            setattr(trade, "sl_pct", float(sl_pct))
-            trade.fb_entry = {**(getattr(trade, "fb_entry", {}) or {}), "sl_pct": float(sl_pct)}
-        except Exception as e:
-            logger.debug(f"[{pair}] sl_pct save skipped: {e}")
-
         return True
 
     # =========================================================================
@@ -1943,9 +2345,51 @@ class AITradingStrategy(IStrategy):
     def order_filled(self, pair: str, trade, order, current_time: datetime,
                      **kwargs) -> None:
         try:
-            # Hanya proses saat trade tutup penuh (bukan entry / partial fill)
+            # Entry fill adalah titik pertama ketika objek trade sudah
+            # persisten. Snapshot kondisi entry disimpan di sini, bukan di
+            # confirm_trade_entry yang memang tidak menerima objek trade.
             if trade.is_open:
+                if not getattr(trade, "fb_entry", None):
+                    dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+                    if len(dataframe):
+                        last = dataframe.iloc[-1]
+                        feature_cols = [
+                            "ema8", "ema13", "ema21", "ema34", "ema50", "ema89", "ema200",
+                            "sma20", "sma50", "sma200", "rsi_14", "rsi_7", "rsi_21",
+                            "macd", "macd_signal", "macd_hist", "stoch_k", "stoch_d",
+                            "srsi_k", "srsi_d", "cci", "willr", "mfi", "roc", "atr",
+                            "atr_pct", "atr_ratio", "bb_width", "bb_pct", "bb_squeeze",
+                            "kc_upper", "kc_lower", "don_high", "don_low", "obv_slope",
+                            "volume_ratio", "volume_slope", "cmf", "vwma", "adx",
+                            "ema50_1d", "ema200_1d", "ema50_4h", "ema200_4h", "adx_1d",
+                            "adx_4h", "rsi_4h", "btc_ema50_1h", "btc_rsi_1h", "mtf_alignment",
+                        ]
+                        features = {
+                            name: float(last[name]) for name in feature_cols
+                            if name in last.index and isinstance(last[name], (int, float))
+                            and not pd.isna(last[name])
+                        }
+                        features.update({"feature_version": "v1", "candle_count": int(len(dataframe))})
+                        regime = str(last.get("regime", "RANGING"))
+                        from shared.feedback import snapshot_entry_conditions
+                        snapshot_entry_conditions(
+                            trade=trade,
+                            regime=regime,
+                            predicted_rr=float(last.get("predicted_rr", self.tp3_rrr) or self.tp3_rrr),
+                            ml_signal=str(last.get("ml_signal_direction", "HOLD")),
+                            ml_prob=float(last.get("ml_probability", 0.5) or 0.5),
+                            conf=float(last.get(
+                                "conf_score_short" if trade.is_short else "conf_score_long", 0
+                            ) or 0),
+                            atr_ratio=float(last.get("atr_ratio", 1.0) or 1.0),
+                            side="short" if trade.is_short else "long",
+                            entry_rate=float(trade.open_rate),
+                            features=features,
+                        )
+                        trade.entry_regime = regime
                 return
+
+            # Hanya proses close penuh (bukan entry / partial fill)
             fb = getattr(trade, "fb_entry", {}) or {}
             side = "short" if trade.is_short else "long"
             entry_rate = float(trade.open_rate or fb.get("entry_rate") or 0.0)

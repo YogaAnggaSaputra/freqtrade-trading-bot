@@ -278,18 +278,25 @@ class LossAnalyzer:
         if not recent_lr or not baseline_lr:
             return {"drift_score": 0.0, "details": "Insufficient returns data"}
 
+        from shared.quant.stats_advanced import kolmogorov_smirnov_2sample, wasserstein_distance_1d
         import statistics
 
         recent_vol = statistics.stdev(recent_lr) if len(recent_lr) > 1 else 0
         baseline_vol = statistics.stdev(baseline_lr) if len(baseline_lr) > 1 else 0
-        drift_score = abs(recent_vol - baseline_vol) / (baseline_vol + 1e-9)
+
+        # Kolmogorov-Smirnov & Wasserstein drift metrics
+        ks_result = kolmogorov_smirnov_2sample(recent_lr, baseline_lr)
+        w_dist = wasserstein_distance_1d(recent_lr, baseline_lr)
+        drift_score = ks_result["d_statistic"]
 
         return {
             "pair": pair,
             "drift_score": round(drift_score, 4),
+            "wasserstein_distance": round(w_dist, 6),
+            "ks_p_value": ks_result["p_value_approx"],
             "recent_volatility": round(recent_vol, 6),
             "baseline_volatility": round(baseline_vol, 6),
             "recent_candle_count": len(recent_candles),
             "baseline_candle_count": len(baseline_candles),
-            "is_drifted": drift_score > 0.5,
+            "is_drifted": ks_result["is_drifted"],
         }

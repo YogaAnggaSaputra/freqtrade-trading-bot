@@ -1,4 +1,6 @@
 import uuid
+import os
+import aiohttp
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -37,6 +39,52 @@ chaser  = LimitChaser(                  # Limit Maker fee-saving engine
     binance_client=client,
     execution_profiler=profiler,
 )
+EXECUTION_GUARD_ENABLED = os.getenv("EXECUTION_GUARD_ENABLED", "false").lower() == "true"
+EXECUTION_GUARD_URL = os.getenv("EXECUTION_GUARD_URL", "http://execution-guard:8000")
+
+
+async def _validate_submission_with_execution_guard(
+    *, pair: str, client_order_id: str, price: float, amount: float, leverage: int,
+) -> None:
+    """Last-mile validation before Binance submission; fail closed when enabled."""
+    if not EXECUTION_GUARD_ENABLED:
+        return
+    try:
+        market = await client.get_ticker(pair)
+        mid_price = float(market.get("price", 0) or 0)
+        if mid_price <= 0:
+            raise HTTPException(status_code=503, detail="Exchange returned no usable market price")
+        pending = await client.get_orders(pair)
+        duplicate = any(str(item.get("clientOrderId", "")) == client_order_id for item in pending)
+        usage = client.get_rate_limit_status()
+        if usage.get("used_weight_1m", 0) >= int(os.getenv("BINANCE_WEIGHT_LIMIT", "1100")):
+            raise HTTPException(status_code=503, detail="Binance request weight near limit")
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=1.0)) as session:
+            async with session.post(f"{EXECUTION_GUARD_URL}/validate", json={
+                "pair": pair, "price": price or mid_price, "mid_price": mid_price,
+                "amount": amount, "leverage": leverage,
+                "pending_same_order": duplicate,
+            }) as response:
+                if response.status != 200:
+                    raise HTTPException(status_code=503, detail="Execution guard unavailable")
+                result = await response.json()
+                if not result.get("approved", False):
+                    raise HTTPException(status_code=409, detail={"execution_guard": result.get("reasons", [])})
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Execution guard error: {exc}") from exc
+
+
+async def validate_with_execution_guard(req: "PlaceOrderRequest") -> None:
+    """Last-mile validation for the normal order endpoint."""
+    await _validate_submission_with_execution_guard(
+        pair=req.pair,
+        client_order_id=req.client_order_id,
+        price=float(req.price or 0),
+        amount=float(req.amount),
+        leverage=req.leverage,
+    )
 
 
 class PlaceOrderRequest(BaseModel):
@@ -52,6 +100,7 @@ class PlaceOrderRequest(BaseModel):
     stop_loss: Decimal
     take_profit: Decimal | None = None
     time_in_force: TimeInForce = TimeInForce.GTC
+    reduce_only: bool = False
 
 
 class CancelOrderRequest(BaseModel):
@@ -59,11 +108,33 @@ class CancelOrderRequest(BaseModel):
     pair: str
 
 
+async def handle_kill_switch(payload: dict) -> None:
+    """Close exchange positions for RED/BLACK kill-switch events."""
+    level = str(payload.get("level", "")).lower()
+    if level not in {"red", "black"} or os.getenv("KILL_SWITCH_CLOSE_POSITIONS", "false").lower() != "true":
+        return
+    positions = await client.get_positions()
+    closed = 0
+    for position in positions:
+        amount = float(position.get("positionAmt", "0") or 0)
+        if not amount:
+            continue
+        symbol = str(position.get("symbol", ""))
+        side = "SELL" if amount > 0 else "BUY"
+        await client.place_order(symbol=symbol, side=side, order_type="market",
+                                 size=str(abs(amount)), leverage=1,
+                                 margin_mode="isolated", reduce_only=True)
+        closed += 1
+    logger.critical("Kill switch %s closed %d exchange positions", level, closed)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     await message_bus.connect()
     await client.start()
+    await message_bus.subscribe(Channels.KILL_SWITCH, handle_kill_switch)
+    await message_bus.start_listening()
     yield
     await client.stop()
     await message_bus.disconnect()
@@ -91,6 +162,8 @@ async def get_account():
             "totalMarginBalance": result.get("totalMarginBalance", "0"),
             "availableBalance": result.get("availableBalance", "0"),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Get account failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
@@ -99,6 +172,7 @@ async def get_account():
 @app.post("/orders")
 async def place_order(req: PlaceOrderRequest):
     try:
+        await validate_with_execution_guard(req)
         result = await client.place_order(
             symbol=req.pair,
             side=req.side.value,
@@ -110,6 +184,7 @@ async def place_order(req: PlaceOrderRequest):
             stop_loss=str(req.stop_loss),
             take_profit=str(req.take_profit) if req.take_profit else None,
             client_order_id=req.client_order_id,
+            reduce_only=req.reduce_only,
         )
 
         order = Order(
@@ -137,6 +212,8 @@ async def place_order(req: PlaceOrderRequest):
         await message_bus.publish(Channels.ORDER_UPDATE, {"order": order.model_dump()})
         return {"success": True, "order_id": order.order_id, "client_order_id": order.client_order_id}
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Place order failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
@@ -151,6 +228,7 @@ class LimitChaserRequest(BaseModel):
     tick_size: float
     regime: str | None = None
     adx: float | None = None
+    client_order_id: str | None = None
 
 
 @app.post("/orders/limit")
@@ -160,6 +238,14 @@ async def place_limit_order(req: LimitChaserRequest):
     atau Market order tergantung kondisi pasar.
     """
     try:
+        client_order_id = req.client_order_id or f"LIMIT-{req.trade_id}-{uuid.uuid4().hex[:12]}"
+        await _validate_submission_with_execution_guard(
+            pair=req.pair,
+            client_order_id=client_order_id,
+            price=req.intended_price,
+            amount=req.quantity,
+            leverage=1,
+        )
         result = await chaser.execute(
             pair=req.pair,
             side=req.side.value,
@@ -168,7 +254,19 @@ async def place_limit_order(req: LimitChaserRequest):
             tick_size=req.tick_size,
             regime=req.regime,
             adx=req.adx,
+            client_order_id=client_order_id,
+            trade_id=req.trade_id,
         )
+        if result.success:
+            recent = profiler.get_recent_records(1)
+            if recent and recent[0].get("is_alert"):
+                await message_bus.publish(Channels.ALERT, {
+                    "type": "execution_quality_alert",
+                    "severity": "high",
+                    "trade_id": req.trade_id,
+                    "pair": req.pair,
+                    "reasons": recent[0].get("alert_reasons", []),
+                })
         return {
             "success": result.success,
             "order_id": result.order_id,
@@ -181,9 +279,17 @@ async def place_limit_order(req: LimitChaserRequest):
             "fee_savings_usdt": result.fee_savings_estimate_usdt,
             "error": result.error,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Limit chaser order failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/execution/summary")
+async def execution_summary():
+    """Rolling execution quality metrics for ops/dashboard consumers."""
+    return profiler.get_summary()
 
 
 @app.delete("/orders/{order_id}")

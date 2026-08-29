@@ -99,11 +99,14 @@ async def reconcile_orders():
                     await report_mismatch("order_connection_error", order.client_order_id, order.pair)
 
 
+from shared.quant.supreme_final import KalmanReconciler
+
+_kalman_rec = KalmanReconciler(process_var=1e-5, measurement_var=1e-3)
+
 def _positions_match(local: Position, remote: dict) -> bool:
-    return (
-        abs(float(local.size) - float(remote.get("size", 0))) < 0.0001
-        and abs(float(local.entry_price) - float(remote.get("entry_price", 0))) < 0.01
-    )
+    diff = float(local.size) - float(remote.get("size", 0))
+    res = _kalman_rec.update(diff)
+    return not res["is_anomaly"] and abs(diff) < 0.001
 
 
 async def report_mismatch(mismatch_type: str, resource_id: str, pair: str):

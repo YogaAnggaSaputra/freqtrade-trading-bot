@@ -26,6 +26,7 @@ from decay_detector import DecayDetector
 from evidence_collector import EvidenceCollector
 from proposal_generator import HermesProposal, ProposalGenerator
 from sqlalchemy import and_, select
+from shared.quant.supreme_final import ThompsonProposalSelector
 
 from shared.db.models import Proposal
 from shared.db.session import AsyncSessionLocal
@@ -53,6 +54,9 @@ class HermesAgent:
         self.min_samples = min_samples
         self.collector = EvidenceCollector()
         self.decay_detector = DecayDetector()  # Strategy decay & concept drift detector
+        self.mab_selector = ThompsonProposalSelector([
+            "parameter_tune", "risk_reduction", "pair_whitelist_update", "regime_threshold_adj"
+        ])
         self._running = False
         self._last_decay_report: dict = {}
 

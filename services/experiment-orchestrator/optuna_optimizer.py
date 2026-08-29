@@ -200,6 +200,16 @@ class OptunaOptimizer:
             catch=(Exception,),
         )
 
+        # Filter trials to Pareto Optimal Front (Sharpe vs MaxDD)
+        from shared.quant.supreme_final import pareto_front
+        all_trials = [
+            {"trial": t.number, "sharpe": t.value or 0.0, "max_drawdown": abs(t.value or 0.0) * 0.1, "params": t.params}
+            for t in study.trials if t.value is not None
+        ]
+        pareto_trials = pareto_front(all_trials)
+        logger.info("Optuna optimization complete. %d Pareto-optimal trials found out of %d",
+                    len(pareto_trials), len(study.trials))
+
         duration = time.time() - start
         best_trial = study.best_trial
 

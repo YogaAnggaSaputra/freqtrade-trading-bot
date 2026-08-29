@@ -11,6 +11,7 @@ from fastapi import FastAPI, Response
 from pydantic import BaseModel
 import uvicorn
 import logging
+from urllib.request import urlopen
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 logging.basicConfig(format='%(message)s', stream=sys.stdout, level=logging.INFO)
@@ -22,7 +23,24 @@ bot_running = False
 bot_state = "stopped"
 
 class StartRequest(BaseModel):
-    mode: str = "live"
+    mode: str | None = None
+
+
+def adaptive_whitelist(fallback: list[str]) -> list[str]:
+    """Resolve live pairlist once at startup; preserve fallback on outage."""
+    if os.getenv("ADAPTIVE_WHITELIST_ENABLED", "false").lower() != "true":
+        return fallback
+    url = os.getenv("ADAPTIVE_WHITELIST_URL", "http://adaptive-whitelist:8000") + "/whitelist?limit=50"
+    try:
+        import json as _json
+        with urlopen(url, timeout=3) as response:  # noqa: S310
+            pairs = _json.loads(response.read().decode()).get("pairs", [])
+        if pairs:
+            logger.info("Adaptive whitelist selected %d live pairs", len(pairs))
+            return pairs
+    except Exception as exc:
+        logger.warning("Adaptive whitelist unavailable, using local fallback: %s", exc)
+    return fallback
 
 def create_config(mode: str) -> str:
     # Read from secrets or environment
@@ -76,6 +94,7 @@ def create_config(mode: str) -> str:
             "BTC/USDT:USDT", "ETH/USDT:USDT", "BNB/USDT:USDT",
             "SOL/USDT:USDT", "XRP/USDT:USDT", "ADA/USDT:USDT",
         ]
+    top_pairs = adaptive_whitelist(top_pairs)
     
     # Tinggal 1 posisi (max_open_trades=1) — cukup 200 pair liquid, bukan 527.
     # VolumePairList = pencarian pair by volume di exchange (native Freqtrade).
@@ -101,7 +120,7 @@ def create_config(mode: str) -> str:
         # notional ~$5.34 dipecah 3 → tiap porsi <$5 min notional Binance → REJECT.
         # Full-position + trailing SL (Layer 1-4) yang nangkep upside. Flip True
         # lagi kalau stake per-trade ≥$2 @5x (notional ≥$20, tiap pecahan >$5).
-        "position_adjustment_enable": False,
+        "position_adjustment_enable": os.getenv("POSITION_ADJUSTMENT_ENABLE", "false").lower() == "true",
         # DB disimpan di volume /freqtrade/user_data agar trade history
         # bertahan lintas rebuild container (sebelumnya di /app = ephemeral).
         "db_url": (
@@ -206,6 +225,9 @@ def run_freqtrade(config_path: str):
         if line:
             logger.info(f"FREQTRADE: {line.strip()}")
     logger.info(f"Freqtrade exited with code {proc.returncode}")
+    global bot_running, bot_state
+    bot_running = False
+    bot_state = "stopped" if proc.returncode == 0 else "error"
     freqtrade_process = None
 
 @app.get("/health")
@@ -226,14 +248,17 @@ async def start_bot(request: StartRequest):
     if bot_running:
         return {"status": "already_running"}
     try:
-        config_path = create_config(request.mode)
+        mode = (request.mode or os.getenv("TRADE_MODE", "dry")).lower()
+        if mode not in {"live", "dry", "dry_run", "demo", "testnet"}:
+            raise ValueError("mode must be one of live, dry, dry_run, demo, testnet")
+        config_path = create_config(mode)
         thread = threading.Thread(target=run_freqtrade, args=(config_path,), daemon=True)
         thread.start()
         freqtrade_process = thread
         bot_running = True
         bot_state = "running"
         await asyncio.sleep(2)
-        return {"status": "started", "mode": request.mode, "config": config_path}
+        return {"status": "started", "mode": mode, "config": config_path}
     except Exception as e:
         logger.error(f"Error starting bot: {e}")
         bot_state = "error"

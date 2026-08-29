@@ -350,6 +350,29 @@ class MAEMFEPrediction(Model):
             self.risk_reward_ratio = round(self.tp_pct / self.sl_pct, 2)
 
 
+class QuantParams(Model):
+    pair: str
+    regime: str = "unknown"
+    sl_atr_multiplier: float = 2.0
+    min_rrr: float = 1.5
+    tp1_rrr: float = 1.5
+    tp2_rrr: float = 2.5
+    tp3_rrr: float = 4.0
+    confluence_threshold: float = 60.0
+    risk_pct: float = 0.01
+    confidence: float = 0.0
+
+
+class SentimentResponse(Model):
+    pair: str
+    score: float = 0.0
+    label: str = "neutral"
+    fear_greed: int | None = None
+    confidence: float = 0.0
+    source: str = "fallback"
+    stale: bool = True
+
+
 __all__ = [
     "OrderSide", "OrderType", "OrderStatus", "TimeInForce", "MarginMode",
     "PositionSide", "RiskDecision", "KillSwitchLevel",
@@ -357,5 +380,5 @@ __all__ = [
     "Model", "Order", "Position", "Fill", "MarketCandle", "MarketSnapshot",
     "TradeIntent", "CheckResult", "RiskCheckResult", "HealthCheck",
     "Proposal", "Experiment", "KillSwitchState", "TradeDossier", "AuditEvent",
-    "OBISnapshot", "RegimeSignal", "MAEMFEPrediction",
+    "OBISnapshot", "RegimeSignal", "MAEMFEPrediction", "QuantParams", "SentimentResponse",
 ]

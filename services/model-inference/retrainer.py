@@ -38,6 +38,7 @@ MIN_TRADES_FOR_MAE_MFE = int(os.getenv("MIN_TRADES_FOR_MAE_MFE", "50"))
 GMM_CANDLE_LOOKBACK_DAYS = int(os.getenv("GMM_CANDLE_LOOKBACK_DAYS", "90"))
 MAE_MFE_LOOKBACK_DAYS = int(os.getenv("MAE_MFE_LOOKBACK_DAYS", "180"))
 STARTUP_DELAY_MINUTES = 30  # Tunggu sebelum retrain pertama kali
+AUTO_RETRAIN_ENABLED = os.getenv("AUTO_RETRAIN_ENABLED", "true").lower() == "true"
 
 
 class MLOpsRetrainer:
@@ -57,6 +58,9 @@ class MLOpsRetrainer:
 
     async def start(self) -> None:
         """Mulai background retraining loop."""
+        if not AUTO_RETRAIN_ENABLED:
+            logger.info("MLOps Retrainer disabled by AUTO_RETRAIN_ENABLED=false")
+            return
         self._running = True
         asyncio.create_task(self._retrain_loop())
         logger.info(

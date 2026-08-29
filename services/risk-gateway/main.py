@@ -1,4 +1,6 @@
 import os
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 from decimal import Decimal
 
@@ -17,8 +19,10 @@ from shared.schemas import TradeIntent
 from shared.security import load_secrets_into_env
 
 load_secrets_into_env()
+logger = logging.getLogger("risk_gateway.main")
 
 message_bus = MessageBus()
+_dead_man_task: asyncio.Task | None = None
 policy = load_policy(os.getenv("POLICY_PATH", "/config/policy.yaml"))
 macro_filter = MacroFilter()               # Economic event calendar filter
 risk_gateway = RiskGateway(policy, macro_filter=macro_filter)
@@ -36,6 +40,10 @@ validation_duration_seconds = Histogram(
 current_equity_gauge = Gauge(
     "risk_current_equity_usdt", "Current wallet equity from Binance"
 )
+ANOMALY_AUTO_PAUSE = os.getenv("ANOMALY_AUTO_PAUSE", "true").lower() == "true"
+EXECUTION_AUTO_PAUSE = os.getenv("EXECUTION_AUTO_PAUSE", "false").lower() == "true"
+DEAD_MAN_ENABLED = os.getenv("DEAD_MAN_ENABLED", "false").lower() == "true"
+DEAD_MAN_TIMEOUT_SECONDS = int(os.getenv("DEAD_MAN_TIMEOUT_SECONDS", "1800"))
 
 
 async def fetch_equity() -> Decimal:
@@ -52,13 +60,87 @@ async def fetch_equity() -> Decimal:
     return EQUITY_FALLBACK
 
 
+async def handle_market_anomaly(payload: dict) -> None:
+    """Freeze new entries briefly when the market feed reports bad data."""
+    if not ANOMALY_AUTO_PAUSE or payload.get("severity") != "high":
+        return
+    reason = "market_feed_anomaly:" + ",".join(payload.get("reasons", []))
+    await risk_gateway._set_kill_switch("orange")
+    await message_bus.publish(Channels.KILL_SWITCH, {
+        "level": "orange", "reason": reason,
+        "close_positions": False, "activated_by": "anomaly-detection",
+    })
+
+
+async def handle_execution_alert(payload: dict) -> None:
+    if not EXECUTION_AUTO_PAUSE or payload.get("type") != "execution_quality_alert":
+        return
+    await risk_gateway._set_kill_switch("orange")
+    await message_bus.publish(Channels.KILL_SWITCH, {
+        "level": "orange", "reason": "execution_quality:" + ",".join(payload.get("reasons", [])),
+        "close_positions": False, "activated_by": "execution-profiler",
+    })
+
+
+async def _dead_man_loop() -> None:
+    """Alert and freeze new entries if the market feed stops reporting."""
+    import redis.asyncio as aioredis
+    from datetime import datetime
+
+    redis_client = aioredis.Redis(
+        host=os.getenv("REDIS_HOST", "redis"),
+        port=int(os.getenv("REDIS_PORT", "6379")),
+        password=os.getenv("REDIS_PASSWORD", "changeme"),
+        decode_responses=True,
+    )
+    key = "market:last_update:" + os.getenv("DEAD_MAN_SYMBOL", "BTCUSDT").upper().replace("/", "").replace(":", "")
+    alerted = False
+    try:
+        while True:
+            try:
+                raw = await redis_client.get(key)
+                age = float("inf")
+                if raw:
+                    stamp = datetime.fromisoformat(str(raw))
+                    age = (datetime.utcnow() - stamp.replace(tzinfo=None)).total_seconds()
+                if age > DEAD_MAN_TIMEOUT_SECONDS:
+                    if not alerted:
+                        alerted = True
+                        await risk_gateway._set_kill_switch("orange")
+                        await message_bus.publish(Channels.ALERT, {
+                            "type": "dead_man_market_feed_stale", "severity": "high",
+                            "key": key, "age_seconds": age,
+                        })
+                elif alerted:
+                    alerted = False
+                    await message_bus.publish(Channels.ALERT, {
+                        "type": "dead_man_market_feed_recovered", "severity": "info", "key": key,
+                    })
+            except Exception as exc:
+                logger.warning("Dead-man monitor check failed: %s", exc)
+            await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        raise
+    finally:
+        await redis_client.aclose()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     await message_bus.connect()
     await macro_filter.start()  # Start economic calendar refresh
+    await message_bus.subscribe(Channels.MARKET_ANOMALY, handle_market_anomaly)
+    await message_bus.subscribe(Channels.ALERT, handle_execution_alert)
+    await message_bus.start_listening()
+    global _dead_man_task
+    if DEAD_MAN_ENABLED:
+        _dead_man_task = asyncio.create_task(_dead_man_loop())
     yield
     await macro_filter.stop()
+    if _dead_man_task and not _dead_man_task.done():
+        _dead_man_task.cancel()
+        await asyncio.gather(_dead_man_task, return_exceptions=True)
     await message_bus.disconnect()
     await close_db()
 
@@ -125,7 +207,7 @@ async def get_checks():
 
 
 @app.post("/killswitch")
-async def set_kill_switch(level: str, reason: str = "Set via API"):
+async def set_kill_switch(level: str, reason: str = "Set via API", pin: str | None = None):
     """Set/reset kill switch level yang dibaca engine saat validasi trade.
 
     level: yellow | orange | red | black | green (green = resume/normal).
@@ -134,7 +216,14 @@ async def set_kill_switch(level: str, reason: str = "Set via API"):
     valid = {"yellow", "orange", "red", "black", "green"}
     if level.lower() not in valid:
         raise HTTPException(status_code=400, detail=f"Invalid level: {level} (use {sorted(valid)})")
+    expected_pin = os.getenv("KILL_SWITCH_PIN", "")
+    if expected_pin and pin != expected_pin:
+        raise HTTPException(status_code=403, detail="Invalid kill-switch PIN")
     await risk_gateway._set_kill_switch(level)
+    await message_bus.publish(Channels.KILL_SWITCH, {
+        "level": level.lower(), "reason": reason, "close_positions": level.lower() in {"red", "black"},
+        "activated_by": "risk-gateway",
+    })
     return {"level": level.lower(), "reason": reason, "status": "ok"}
 
 

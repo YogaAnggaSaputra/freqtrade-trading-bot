@@ -23,6 +23,7 @@ import pickle
 from typing import Any
 
 import numpy as np
+from shared.quant.stochastic import GaussianHMM
 
 logger = logging.getLogger("model_inference.regime_classifier")
 
@@ -312,3 +313,69 @@ class GMMRegimeClassifier:
             "trend_strength": float(min(abs(momentum) * 30, 1.0)),
             "regime_duration_bars": 1, "source": "rule_based_fallback",
         }
+
+
+class HMMRegimeClassifier:
+    """
+    Hidden Markov Model (Baum-Welch EM) untuk smoothing temporal regime transition.
+    Menghilangkan oscillation cepat antar-state dengan memanfaatkan transition matrix.
+    """
+
+    def __init__(self, n_states: int = N_REGIMES, model_path: str = HMM_MODEL_PATH):
+        self.n_states = n_states
+        self.model_path = model_path
+        self._hmm: GaussianHMM | None = None
+        self._load()
+
+    def _load(self) -> None:
+        if os.path.exists(self.model_path):
+            try:
+                with open(self.model_path, "rb") as f:
+                    saved = pickle.load(f)
+                self._hmm = saved.get("hmm")
+                logger.info("HMM regime model loaded from %s", self.model_path)
+            except Exception as e:
+                logger.warning("Failed to load HMM model: %s", e)
+
+    def is_trained(self) -> bool:
+        return self._hmm is not None and self._hmm.converged
+
+    def train(self, candles: list[dict[str, Any]]) -> dict[str, Any]:
+        if len(candles) < 100:
+            return {"status": "insufficient_data", "samples": len(candles)}
+        X = _extract_regime_features(candles)
+        if X.shape[0] < 50:
+            return {"status": "insufficient_features", "samples": X.shape[0]}
+        obs = X.tolist()
+        hmm = GaussianHMM(n_states=self.n_states, seed=42).fit(obs)
+        self._hmm = hmm
+        os.makedirs(MODEL_DIR, exist_ok=True)
+        with open(self.model_path, "wb") as f:
+            pickle.dump({"hmm": hmm}, f)
+        logger.info("HMM trained: %d samples, log_likelihood=%.1f", X.shape[0], hmm.log_likelihood)
+        return {"status": "trained", "samples": X.shape[0], "log_likelihood": round(hmm.log_likelihood, 1)}
+
+    def predict(self, candles: list[dict[str, Any]]) -> dict[str, Any]:
+        if not self.is_trained():
+            return {"regime": "sideways_low_vol", "state": 0, "confidence": 0.5, "source": "hmm_untrained"}
+        X = _extract_regime_features(candles)
+        if X.shape[0] == 0:
+            return {"regime": "sideways_low_vol", "state": 0, "confidence": 0.5, "source": "hmm_no_features"}
+        obs = X[-30:].tolist()
+        probas = self._hmm.predict_proba(obs)
+        if not probas:
+            return {"regime": "sideways_low_vol", "state": 0, "confidence": 0.5, "source": "hmm_error"}
+        last = probas[-1]
+        state = max(range(len(last)), key=lambda j: last[j])
+        confidence = float(last[state])
+        regime = REGIME_LABELS[state % len(REGIME_LABELS)]
+        viterbi = self._hmm.viterbi(obs)
+        return {
+            "regime": regime,
+            "state": state,
+            "confidence": round(confidence, 4),
+            "viterbi_state": viterbi[-1] if viterbi else state,
+            "next_state_distribution": [round(v, 4) for v in self._hmm.next_state_distribution(last)],
+            "source": "gaussian_hmm",
+        }
+
