@@ -515,6 +515,7 @@ services:
 
   # ─── Monitoring ─────────────────────────────────────────────────────────────
   quant-engine:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: services/quant-engine/Dockerfile
@@ -526,6 +527,7 @@ services:
       - postgres
 
   sentiment-engine:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: services/sentiment-engine/Dockerfile
@@ -538,6 +540,7 @@ services:
       TELEGRAM_SENTIMENT_MAX_MESSAGES: ${TELEGRAM_SENTIMENT_MAX_MESSAGES:-50}
 
   on-chain-engine:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: services/on-chain-engine/Dockerfile
@@ -548,6 +551,7 @@ services:
       ONCHAIN_DATA_PROVIDER_API_KEY: ${ONCHAIN_DATA_PROVIDER_API_KEY:-}
 
   tick-recorder:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: services/tick-recorder/Dockerfile
@@ -559,6 +563,7 @@ services:
       - postgres
 
   anomaly-detection:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: services/anomaly-detection/Dockerfile
@@ -566,6 +571,7 @@ services:
       - "8024:8000"
 
   adaptive-whitelist:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: services/adaptive-whitelist/Dockerfile
@@ -583,6 +589,7 @@ services:
         condition: service_healthy
 
   execution-guard:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: services/execution-guard/Dockerfile
@@ -590,6 +597,7 @@ services:
       - "8026:8000"
 
   execution-quality:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: services/execution-quality/Dockerfile
@@ -597,6 +605,7 @@ services:
       - "8027:8000"
 
   capital-allocation:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: services/capital-allocation/Dockerfile
@@ -604,6 +613,7 @@ services:
       - "8028:8000"
 
   performance-attribution:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: services/performance-attribution/Dockerfile
@@ -619,6 +629,7 @@ services:
       DB_NAME: ${DB_NAME:-botbinance}
 
   position-monitor:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: services/position-monitor/Dockerfile
@@ -635,6 +646,7 @@ services:
         condition: service_healthy
 
   news-alpha:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: services/news-alpha/Dockerfile
@@ -648,6 +660,7 @@ services:
       NEWS_LLM_API_KEY: ${NEWS_LLM_API_KEY:-}
 
   post-exit-regret:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: services/post-exit-regret/Dockerfile
@@ -663,6 +676,7 @@ services:
       - postgres
 
   post-exit-regret-worker:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: services/post-exit-regret/Dockerfile
@@ -674,6 +688,7 @@ services:
       - postgres
 
   telegram-control:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: services/telegram-control/Dockerfile
@@ -687,6 +702,7 @@ services:
       - risk-gateway
 
   orderbook-intelligence:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: services/orderbook-intelligence/Dockerfile
@@ -694,6 +710,7 @@ services:
       - "8033:8000"
 
   predictive-layer:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: services/predictive-layer/Dockerfile
