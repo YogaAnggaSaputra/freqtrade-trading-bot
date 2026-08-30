@@ -1040,6 +1040,9 @@ class AITradingStrategy(IStrategy):
             (dataframe["in_killzone"]        == 1)         &  # Gate 1: Kill zone
             (dataframe["fomo_lock"]          == 0)         &  # Gate 2: No FOMO
             (dataframe["regime"]             != "TRENDING_BEAR")  &  # Gate 3: Regime
+            # Gate 3b: Anti-bearish tactical — blokir LONG kalau BTC 1h bearish
+            # konsensus 2/2: RSI < 40 DAN close < EMA50 (bukan 1 sinyal)
+            (dataframe["btc_rsi_1h"].ge(40) | dataframe["btc_close_1h"].ge(dataframe["btc_ema50_1h"])) &
             (dataframe["conf_score_long"]    >= self.min_conf_long.value)  &  # Gate 4: Score
             (dataframe["adx"]                >= self.adx_threshold.value)  &  # Gate 5: Trend
             (dataframe["volume_ratio"]       >= self.volume_spike_factor.value)  &  # Gate 6: Volume
@@ -1053,6 +1056,9 @@ class AITradingStrategy(IStrategy):
             (dataframe["in_killzone"]        == 1)         &
             (dataframe["fomo_lock"]          == 0)         &
             (dataframe["regime"]             != "TRENDING_BULL") &
+            # Gate 3b symmetric: blokir SHORT kalau BTC 1h bullish kuat
+            # konsensus 2/2: RSI > 60 DAN close > EMA50
+            (dataframe["btc_rsi_1h"].le(60) | dataframe["btc_close_1h"].le(dataframe["btc_ema50_1h"])) &
             (dataframe["conf_score_short"]   >= self.min_conf_short.value) &
             (dataframe["adx"]                >= self.adx_threshold.value) &
             (dataframe["volume_ratio"]       >= self.volume_spike_factor.value) &
