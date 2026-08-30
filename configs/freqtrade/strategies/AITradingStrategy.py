@@ -968,6 +968,24 @@ class AITradingStrategy(IStrategy):
         # ── [FIX-CRITICAL] Regime — VECTORIZED, no lookahead ──
         dataframe["regime"] = detect_regime_vectorized(dataframe)
 
+        # ── [P1] PISAH MACRO vs TACTICAL REGIME ──
+        # MACRO (D1): arah struktural — EMA50 vs EMA200 1d + ADX 1d
+        macro_bull = (dataframe["ema50_1d"] > dataframe["ema200_1d"]) & (dataframe["adx_1d"] > 20)
+        macro_bear = (dataframe["ema50_1d"] < dataframe["ema200_1d"]) & (dataframe["adx_1d"] > 20)
+        dataframe["regime_macro"] = np.select(
+            [macro_bull, macro_bear],
+            ["TRENDING_BULL", "TRENDING_BEAR"],
+            default="RANGING",
+        )
+        # TACTICAL (1H): arah eksekusi — close vs EMA50 1h + RSI 1h
+        tac_bull = (dataframe["close_1h"] > dataframe["ema50_1h"]) & (dataframe["rsi_1h"] > 50)
+        tac_bear = (dataframe["close_1h"] < dataframe["ema50_1h"]) & (dataframe["rsi_1h"] < 50)
+        dataframe["regime_tactical"] = np.select(
+            [tac_bull, tac_bear],
+            ["TRENDING_BULL", "TRENDING_BEAR"],
+            default="RANGING",
+        )
+
         # Multi-timeframe momentum alignment used by open-position health.
         mtf_parts = []
         if "ema13_15m" in dataframe:
@@ -1040,7 +1058,8 @@ class AITradingStrategy(IStrategy):
         long_gates = (
             (dataframe["in_killzone"]        == 1)         &  # Gate 1: Kill zone
             (dataframe["fomo_lock"]          == 0)         &  # Gate 2: No FOMO
-            (dataframe["regime"]             != "TRENDING_BEAR")  &  # Gate 3: Regime
+            (dataframe["regime_macro"]       != "TRENDING_BEAR")  &  # Gate 3: Macro (D1)
+            (dataframe["regime_tactical"]    != "TRENDING_BEAR")  &  # Gate 3a: Tactical (1H) — anti-trend pullback
             # Gate 3b: Anti-bearish tactical — blokir LONG kalau BTC 1h bearish
             # konsensus 2/2: RSI < 40 DAN close < EMA50 (bukan 1 sinyal)
             (dataframe["btc_rsi_1h"].ge(40) | dataframe["btc_close_1h"].ge(dataframe["btc_ema50_1h"])) &
@@ -1056,7 +1075,8 @@ class AITradingStrategy(IStrategy):
         short_gates = (
             (dataframe["in_killzone"]        == 1)         &
             (dataframe["fomo_lock"]          == 0)         &
-            (dataframe["regime"]             != "TRENDING_BULL") &
+            (dataframe["regime_macro"]       != "TRENDING_BULL")  &  # Gate 3: Macro (D1)
+            (dataframe["regime_tactical"]    != "TRENDING_BULL")  &  # Gate 3a: Tactical (1H)
             # Gate 3b symmetric: blokir SHORT kalau BTC 1h bullish kuat
             # konsensus 2/2: RSI > 60 DAN close > EMA50
             (dataframe["btc_rsi_1h"].le(60) | dataframe["btc_close_1h"].le(dataframe["btc_ema50_1h"])) &
@@ -1733,10 +1753,13 @@ class AITradingStrategy(IStrategy):
             return "timeout_flat_exit"
 
         # ── Regime change exit ──
+        # [P1] gunakan tactical (1H) untuk exit — 1H flip = exit cepat,
+        # jangan nunggu D1 (macro) berbalik (terlambat untuk intraday).
         regime = last.get("regime", "RANGING")
+        regime_tactical = last.get("regime_tactical", regime)
         adaptive_exit = _quant_params(pair, str(regime))
         tp3_rrr = float(adaptive_exit.get("tp3_rrr", self.tp3_rrr))
-        regime_exit = (not trade.is_short and regime == "TRENDING_BEAR") or (trade.is_short and regime == "TRENDING_BULL")
+        regime_exit = (not trade.is_short and regime_tactical == "TRENDING_BEAR") or (trade.is_short and regime_tactical == "TRENDING_BULL")
         if regime_exit and not consensus_enabled:
             return "regime_change_to_bear" if not trade.is_short else "regime_change_to_bull"
         funding_exit = False

@@ -158,7 +158,8 @@ def create_config(mode: str) -> str:
             "pair_blacklist": [
                 "币安人生/USDT:USDT",
                 "我踏马来了/USDT:USDT",
-                "龙虾/USDT:USDT"
+                "龙虾/USDT:USDT",
+                "牛来/USDT:USDT"
             ],
             "symmetrize": True,
             "ccxt_config": {"enableRateLimit": True},
