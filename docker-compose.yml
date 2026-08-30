@@ -609,6 +609,12 @@ services:
       - "8029:8000"
     depends_on:
       - postgres
+    environment:
+      DB_HOST: ${DB_HOST:-postgres}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_USER: ${DB_USER:-botbinance}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-botbinance}
 
   position-monitor:
     build:
@@ -644,6 +650,14 @@ services:
       dockerfile: services/post-exit-regret/Dockerfile
     ports:
       - "8032:8000"
+    environment:
+      DB_HOST: ${DB_HOST:-postgres}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_USER: ${DB_USER:-botbinance}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-botbinance}
+    depends_on:
+      - postgres
 
   post-exit-regret-worker:
     build:
