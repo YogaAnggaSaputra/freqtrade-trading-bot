@@ -146,6 +146,7 @@ _news_feed_cache: dict = {}
 
 
 def _news_classify(pair: str, headline: str) -> dict:
+    global _news_feed_cache
     if not NEWS_ALPHA_ENABLED:
         return {}
     # Explicit headline (env/override) takes precedence.

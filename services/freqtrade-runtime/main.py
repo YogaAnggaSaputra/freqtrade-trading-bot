@@ -153,6 +153,13 @@ def create_config(mode: str) -> str:
             "key": api_key,
             "secret": api_secret,
             "pair_whitelist": top_pairs,
+            # Exclude Chinese meme coins tanpa data 1d (spam log informative
+            # + VolumePairList tetap bisa menariknya karena volume tinggi).
+            "pair_blacklist": [
+                "币安人生/USDT:USDT",
+                "我踏马来了/USDT:USDT",
+                "龙虾/USDT:USDT"
+            ],
             "symmetrize": True,
             "ccxt_config": {"enableRateLimit": True},
             "ccxt_async_config": {"enableRateLimit": True}
