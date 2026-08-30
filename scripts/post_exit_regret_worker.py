@@ -19,7 +19,7 @@ async def run_once() -> int:
           FROM trade_outcomes t LEFT JOIN exit_regrets r ON r.trade_id = CAST(t.trade_id AS TEXT)
           WHERE r.id IS NULL AND t.timestamp_exit < :ready
           ORDER BY t.timestamp_exit LIMIT 100
-        """), {"ready": datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=105)})).mappings().all()
+        """), {"ready": datetime.now(UTC) - timedelta(minutes=105)})).mappings().all()
         for outcome in outcomes:
             conditions = outcome.get("entry_conditions") or {}
             side = str(conditions.get("side", "long")).lower()
@@ -29,7 +29,7 @@ async def run_once() -> int:
               SELECT close FROM market_candles
               WHERE pair=:pair AND timeframe='5m' AND timestamp > :exit
               ORDER BY timestamp LIMIT 20
-            """), {"pair": outcome["pair"], "exit": outcome["timestamp_exit"]})).scalars().all()
+            """), {"pair": outcome["pair"], "exit": outcome["timestamp_exit"].replace(tzinfo=None)})).scalars().all()
             if not candles: continue
             prices = [float(v) for v in candles]
             from shared.quant.supreme_final import counterfactual_exit_regret

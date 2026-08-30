@@ -203,6 +203,60 @@ async def cmd_positions(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed)
 
 
+PERFORMANCE_ATTRIBUTION_URL = os.getenv("PERFORMANCE_ATTRIBUTION_URL", "http://performance-attribution:8000")
+
+
+@bot.tree.command(name="report", description="Tampilkan breakdown performa per regime/pair")
+async def cmd_report(interaction: discord.Interaction):
+    if not authorized(interaction):
+        await interaction.response.send_message("Unauthorized", ephemeral=True)
+        return
+    await interaction.response.defer()
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{PERFORMANCE_ATTRIBUTION_URL}/report", timeout=8) as r:
+                if r.status != 200:
+                    await interaction.followup.send("Report service unreachable.")
+                    return
+                data = await r.json()
+        rows = data.get("rows", [])
+        if not rows:
+            await interaction.followup.send("No trade data yet.")
+            return
+        embed = discord.Embed(
+            title="Performance Attribution",
+            description=f"`{data.get('count', 0)}` closed trades by regime/pair/exit",
+            color=COLOR_BLUE,
+            timestamp=datetime.now(UTC),
+        )
+        # Group top 8 by |pnl| desc
+        sorted_rows = sorted(rows, key=lambda x: abs(x.get("pnl", 0)), reverse=True)[:8]
+        for row in sorted_rows:
+            pair = row.get("pair", "?")
+            regime = row.get("regime", "?")
+            reason = row.get("exit_reason", "?")
+            pnl = float(row.get("pnl", 0))
+            pnl_sign = "+" if pnl >= 0 else ""
+            trades = int(row.get("trades", 1))
+            avg_pnl = float(row.get("avg_pnl", 0))
+            avg_rr = row.get("avg_actual_rr")
+            rr_str = f" | RR {float(avg_rr):.2f}" if avg_rr is not None else ""
+            embed.add_field(
+                name=f"{pair} [{regime}]",
+                value=(
+                    f"`{pnl_sign}{pnl:.2f}` USDT ({trades}t, "
+                    f"avg {avg_pnl:+.2%}){rr_str}\n"
+                    f"exit: `{reason}`"
+                ),
+                inline=False,
+            )
+        embed.set_footer(text=f"From {PERFORMANCE_ATTRIBUTION_URL}")
+        await interaction.followup.send(embed=embed)
+    except Exception as exc:
+        await interaction.followup.send(f"Report error: {exc}")
+
+
 @bot.tree.command(name="kill", description="Aktifkan Kill Switch darurat")
 @app_commands.describe(
     level="Level kill switch: yellow | orange | red | black",

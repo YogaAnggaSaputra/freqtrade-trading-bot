@@ -56,8 +56,15 @@ def _parse_json_response(value: str) -> dict | None:
     return None
 
 
+NEWS_LLM_ENABLED = os.getenv("NEWS_LLM_ENABLED", "false").strip().lower() == "true"
+NEWS_LLM_API_KEY = os.getenv("NEWS_LLM_API_KEY", "").strip()
+NEWS_LLM_URL = os.getenv("NEWS_LLM_URL", "http://ollama:11434/api/generate")
+NEWS_LLM_MODEL = os.getenv("NEWS_LLM_MODEL", "qwen2.5:1.5b")
+NEWS_LLM_TIMEOUT_SECONDS = float(os.getenv("NEWS_LLM_TIMEOUT_SECONDS", "2.5"))
+
+
 async def _llm_classify(item: Headline) -> dict | None:
-    """Optional Ollama-compatible Qwen/Llama classifier; never fail-closed on news outage."""
+    """Optional Ollama/OpenAI-compatible classifier; never fail-closed on news outage."""
     if not NEWS_LLM_ENABLED or not item.headline.strip():
         return None
     prompt = (
@@ -68,13 +75,22 @@ async def _llm_classify(item: Headline) -> dict | None:
     )
     try:
         timeout = aiohttp.ClientTimeout(total=NEWS_LLM_TIMEOUT_SECONDS)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(NEWS_LLM_URL, json={
+        headers = {"Content-Type": "application/json"}
+        if NEWS_LLM_API_KEY:
+            headers["Authorization"] = f"Bearer {NEWS_LLM_API_KEY}"
+        # OpenAI-compatible payload; falls back to Ollama format if URL contains /api/generate
+        is_ollama = "/api/generate" in NEWS_LLM_URL
+        if is_ollama:
+            payload = {"model": NEWS_LLM_MODEL, "prompt": prompt, "stream": False, "format": "json"}
+        else:
+            payload = {
                 "model": NEWS_LLM_MODEL,
-                "prompt": prompt,
+                "messages": [{"role": "user", "content": prompt}],
                 "stream": False,
-                "format": "json",
-            }) as response:
+                "response_format": {"type": "json_object"},
+            }
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(NEWS_LLM_URL, json=payload, headers=headers) as response:
                 if response.status >= 400:
                     return None
                 payload = await response.json(content_type=None)

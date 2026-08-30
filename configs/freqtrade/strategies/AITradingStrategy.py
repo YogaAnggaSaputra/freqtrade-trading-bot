@@ -38,6 +38,7 @@ from pandas import DataFrame
 from shared.quant.position import position_health, exit_consensus
 from shared.quant.allocation import exposure_multiplier
 from shared.quant.correlation import pearson, average_correlation
+from shared.quant.predictive import measured_move, liquidity_levels
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,7 @@ NEWS_ALPHA_ENABLED = os.getenv("NEWS_ALPHA_ENABLED", "false").lower() == "true"
 ON_CHAIN_ENGINE_URL = os.getenv("ON_CHAIN_ENGINE_URL", "http://on-chain-engine:8000")
 ON_CHAIN_ENGINE_ENABLED = os.getenv("ON_CHAIN_ENGINE_ENABLED", "false").lower() == "true"
 _onchain_cache: dict[str, dict] = {}
+PREDICTIVE_LAYER_ENABLED = os.getenv("PREDICTIVE_LAYER_ENABLED", "true").lower() == "true"
 POSITION_MONITOR_URL = os.getenv("POSITION_MONITOR_URL", "http://position-monitor:8000")
 POSITION_MONITOR_ENABLED = os.getenv("POSITION_MONITOR_ENABLED", "false").lower() == "true"
 _position_report_cache: dict[str, float] = {}
@@ -2048,6 +2050,40 @@ class AITradingStrategy(IStrategy):
                     return False
             except (TypeError, ValueError):
                 pass
+
+        # ── 6b. Predictive liquidity telemetry (fail-open) ──
+        # Liquidity clustering dari swing highs/lows → entry zone proximity.
+        # HANYA telemetry (log), tidak memblokir entry — diukur dulu apakah
+        # ada sinyal prediktif sebelum dijadikan hard gate.
+        if PREDICTIVE_LAYER_ENABLED:
+            try:
+                _highs = dataframe["high"].tail(50).tolist()
+                _lows  = dataframe["low"].tail(50).tolist()
+                _levels = liquidity_levels(_highs, _lows, tolerance=0.001)
+                if _levels:
+                    _near = min(_levels, key=lambda x: abs(float(x) - rate))
+                    _dist_pct = abs(float(_near) - rate) / rate
+                    if _dist_pct is not None and _dist_pct <= 0.003:
+                        logger.info(
+                            f"[{pair}] predictive-liquidity: entry {rate:.4f} near "
+                            f"swing zone {float(_near):.4f} (Δ {_dist_pct:.2%}) — telemetry only"
+                        )
+            except Exception as exc:
+                logger.debug(f"[{pair}] predictive liquidity telemetry skipped: {exc}")
+
+        # ── 6c. Measured-move TP telemetry (fail-open) ──
+        if PREDICTIVE_LAYER_ENABLED:
+            try:
+                _ph = last.get("r1", last.get("r2", rate * 1.02))
+                _pl = last.get("s1", last.get("s2", rate * 0.98))
+                _mm = measured_move(float(_ph), float(_pl), breakout_up=(side == "long"))
+                _mm_dist = abs(float(_mm) - rate) / rate
+                logger.info(
+                    f"[{pair}] predictive measured-move TP ≈ {float(_mm):.4f} "
+                    f"(Δ {_mm_dist:.2%}) side={side} — telemetry only"
+                )
+            except Exception as exc:
+                logger.debug(f"[{pair}] measured-move telemetry skipped: {exc}")
 
         # ── 2. Dead zone & FOMO lock ──
         if last.get("session_dead", 0) == 1:

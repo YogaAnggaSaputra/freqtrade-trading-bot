@@ -79,6 +79,7 @@ services:
       DB_USER: ${DB_USER:-botbinance}
       DB_PASSWORD: ${DB_PASSWORD}
       DB_NAME: ${DB_NAME:-botbinance}
+      EXECUTION_GUARD_ENABLED: ${EXECUTION_GUARD_ENABLED:-true}
     ports:
       - "127.0.0.1:8001:8000"
     depends_on:
@@ -643,6 +644,7 @@ services:
       NEWS_LLM_URL: ${NEWS_LLM_URL:-http://ollama:11434/api/generate}
       NEWS_LLM_MODEL: ${NEWS_LLM_MODEL:-qwen2.5:1.5b}
       NEWS_LLM_TIMEOUT_SECONDS: ${NEWS_LLM_TIMEOUT_SECONDS:-2.5}
+      NEWS_LLM_API_KEY: ${NEWS_LLM_API_KEY:-}
 
   post-exit-regret:
     build:
