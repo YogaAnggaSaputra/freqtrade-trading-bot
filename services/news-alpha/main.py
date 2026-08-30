@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
 import re
+import time
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 
 import aiohttp
+import logging
 from fastapi import FastAPI
 from pydantic import BaseModel
 from shared.quant.supreme_final import tfidf_decay_sentiment
 
-app = FastAPI(title="News Alpha", version="2.0.0 (TF-IDF & Decay Edition)")
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="News Alpha", version="3.0.0 (TF-IDF & Decay + RSS Poller)")
 class Headline(BaseModel):
     pair: str
     headline: str
@@ -123,5 +130,98 @@ async def health(): return {"status": "healthy", "service": "news-alpha"}
 @app.post("/classify")
 async def classify(item: Headline):
     return await _llm_classify(item) or _tfidf_classify(item)
+
+
+# ── RSS Feed Poller ──
+
+RSS_FEEDS = [
+    "https://cointelegraph.com/rss",
+    "https://cryptopanic.com/news/rss/BTC/1/",
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+]
+_latest_news: list[dict] = []
+_news_lock = asyncio.Lock()
+POLL_INTERVAL = int(os.getenv("NEWS_POLL_INTERVAL_SECONDS", "300"))
+
+
+async def _fetch_rss(session: aiohttp.ClientSession, url: str) -> list[dict]:
+    """Fetch RSS, parse XML, return [{title, link, pub_date, source}]."""
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15),
+                                headers={"User-Agent": "Mozilla/5.0"}) as r:
+            if r.status >= 400:
+                return []
+            body = await r.text()
+    except Exception:
+        return []
+    articles = []
+    source_label = url.split("//")[1].split("/")[0].replace("www.", "")
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(body)
+        ns = {"dc": "http://purl.org/dc/elements/1.1/"}
+        for item in root.iter("item"):
+            title = item.findtext("title", "").strip()
+            link = item.findtext("link", "").strip()
+            pub = item.findtext("pubDate", "") or item.findtext("dc:date", "", ns)
+            if not title:
+                continue
+            articles.append({
+                "title": title, "link": link, "pub_date": pub,
+                "source": source_label, "fetched": datetime.now(UTC).isoformat(),
+            })
+    except ET.ParseError:
+        pass
+    return articles
+
+
+async def _poller_loop():
+    """Periodic RSS poller: fetch, classify, store 5 latest per pair."""
+    global _latest_news
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                all_articles = []
+                for feed in RSS_FEEDS:
+                    all_articles.extend(await _fetch_rss(session, feed))
+                if not all_articles:
+                    await asyncio.sleep(POLL_INTERVAL)
+                    continue
+                seen = set()
+                unique = []
+                for a in all_articles:
+                    key = a["title"].lower().strip()
+                    if key not in seen:
+                        seen.add(key)
+                        unique.append(a)
+                unique.sort(key=lambda x: x.get("pub_date", ""), reverse=True)
+                classified = []
+                for a in unique[:10]:
+                    item = Headline(pair="BTC/USDT", headline=a["title"])
+                    result = await _llm_classify(item) or _tfidf_classify(item)
+                    a["score"] = result.get("score", 0)
+                    a["label"] = result.get("label", "neutral")
+                    classified.append(a)
+                async with _news_lock:
+                    _latest_news = classified[:10]
+                    logger.info("News poller: %d articles (%d unique, %d classified)",
+                                len(all_articles), len(unique), len(classified))
+        except Exception as exc:
+            logger.debug("News poller error: %s", exc)
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(_poller_loop())
+
+
+@app.get("/latest")
+async def latest():
+    """Return the 5 most recent classified articles."""
+    async with _news_lock:
+        return {"articles": _latest_news[:5]}
+
+
 if __name__ == "__main__":
     import uvicorn; uvicorn.run(app, host="0.0.0.0", port=8000)

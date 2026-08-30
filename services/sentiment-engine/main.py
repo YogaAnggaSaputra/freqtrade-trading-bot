@@ -85,6 +85,38 @@ async def _fetch_sentiment(symbol: str) -> SentimentResponse:
                 source = "cryptopanic"
             except Exception:
                 pass
+        # Cloudflare often 403s datacenter IPs on api/v1 — fall back to the
+        # public RSS endpoint (no auth, accessible) when the API fails.
+        if not cryptopanic_ok:
+            try:
+                import re as _re
+                import xml.etree.ElementTree as ET
+                async with session.get(
+                    f"https://cryptopanic.com/news/rss/{symbol}/1/",
+                    headers={"User-Agent": "Mozilla/5.0"},
+                ) as response:
+                    rss_body = await response.text()
+                if response.status == 200 and rss_body.strip():
+                    titles = []
+                    try:
+                        root = ET.fromstring(rss_body)
+                        titles = [item.findtext("title", "").strip()
+                                  for item in root.iter("item") if item.findtext("title", "").strip()]
+                    except ET.ParseError:
+                        # Malformed XML tolerated: regex extract <title> tags.
+                        titles = [t.strip() for t in
+                                  _re.findall(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>",
+                                              rss_body, _re.DOTALL)][:30]
+                    if titles:
+                        positive = ("approval", "approved", "partnership", "listing", "adoption", "etf", "upgrade")
+                        negative = ("hack", "exploit", "lawsuit", "ban", "delist", "liquidation", "fraud")
+                        values = [sum(w in t.lower() for w in positive) -
+                                  sum(w in t.lower() for w in negative) for t in titles[:30]]
+                        score = max(-1.0, min(1.0, sum(values) / max(len(values), 1) * .25))
+                        source = "cryptopanic-rss"
+                        cryptopanic_ok = True
+            except Exception:
+                pass
         if fear_greed is not None:
             source = "fear-greed+cryptopanic" if cryptopanic_ok else "fear-greed"
             score = max(-1.0, min(1.0, score + (fear_greed - 50) / 100)) / 2

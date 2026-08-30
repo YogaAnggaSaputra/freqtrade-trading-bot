@@ -142,15 +142,43 @@ def _quant_factor_score(pair: str, side: str, last) -> float | None:
     return None
 
 
+_news_feed_cache: dict = {}
+
+
 def _news_classify(pair: str, headline: str) -> dict:
-    if not NEWS_ALPHA_ENABLED or not headline:
+    if not NEWS_ALPHA_ENABLED:
         return {}
+    # Explicit headline (env/override) takes precedence.
+    if headline:
+        try:
+            payload = json.dumps({"pair": pair, "headline": headline}).encode()
+            req = Request(f"{NEWS_ALPHA_URL}/classify", data=payload,
+                          headers={"Content-Type": "application/json"})
+            with urlopen(req, timeout=0.35) as response:  # noqa: S310
+                return json.loads(response.read().decode("utf-8")) if response.status == 200 else {}
+        except Exception:
+            return {}
+    # No explicit headline → aggregate the latest RSS-classified feed (cached 5 min).
+    cached = _news_feed_cache.get("data")
+    if cached and time.time() - _news_feed_cache.get("ts", 0) < 300:
+        return cached
     try:
-        payload = json.dumps({"pair": pair, "headline": headline}).encode()
-        req = Request(f"{NEWS_ALPHA_URL}/classify", data=payload,
-                      headers={"Content-Type": "application/json"})
-        with urlopen(req, timeout=0.35) as response:  # noqa: S310
-            return json.loads(response.read().decode("utf-8")) if response.status == 200 else {}
+        req = Request(f"{NEWS_ALPHA_URL}/latest", headers={"Accept": "application/json"})
+        with urlopen(req, timeout=0.5) as response:  # noqa: S310
+            data = json.loads(response.read().decode("utf-8")) if response.status == 200 else {}
+        articles = data.get("articles", [])
+        if not articles:
+            return {}
+        scores = [float(a.get("score", 0.0) or 0.0) for a in articles]
+        aggregate = sum(scores) / len(scores)
+        label = "bullish" if aggregate > 0.15 else ("bearish" if aggregate < -0.15 else "neutral")
+        result = {
+            "pair": pair, "score": aggregate, "label": label,
+            "event": "positive_event" if aggregate > 0.2 else ("negative_event" if aggregate < -0.2 else "none"),
+            "source": f"rss_aggregate:{len(articles)}",
+        }
+        _news_feed_cache = {"ts": time.time(), "data": result}
+        return result
     except Exception:
         return {}
 
