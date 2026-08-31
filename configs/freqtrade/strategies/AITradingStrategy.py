@@ -2093,7 +2093,7 @@ class AITradingStrategy(IStrategy):
 
         # Funding/OI is an optional on-chain confirmation. Extreme positive
         # funding means crowded longs; extreme negative funding crowds shorts.
-        chain = _onchain_metrics(pair)
+        chain = _onchain_metrics(pair) or {}
         funding = float(chain.get("aggregated_funding_rate", 0.0) or 0.0)
         oi_delta = float(chain.get("open_interest_delta_pct", 0.0) or 0.0)
         netflow_signal = chain.get("netflow_signal")
