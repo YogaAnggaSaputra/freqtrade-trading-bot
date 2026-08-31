@@ -1060,7 +1060,7 @@ class AITradingStrategy(IStrategy):
             (dataframe["fomo_lock"]          == 0)         &  # Gate 2: No FOMO
             (dataframe["regime_macro"]       != "TRENDING_BEAR")  &  # Gate 3: Macro (D1)
             (dataframe["regime_tactical"]    != "TRENDING_BEAR")  &  # Gate 3a: Tactical (1H) — anti-trend pullback
-            (dataframe["regime"]             != "CHOPPY")          &  # Gate 3b: [P3] RANGING+CHOPPY + LONG = sel terburuk (WR 28%, net -0.85)
+            (dataframe["regime_tactical"]    != "RANGING")         &  # Gate 3b: [P3] RANGING/CHOPPY 1H + LONG = sel terburuk (WR 28%, net -0.85) — butuh arah 1H jelas
             # Gate 3b: Anti-bearish tactical — blokir LONG kalau BTC 1h bearish
             # konsensus 2/2: RSI < 40 DAN close < EMA50 (bukan 1 sinyal)
             (dataframe["btc_rsi_1h"].ge(40) | dataframe["btc_close_1h"].ge(dataframe["btc_ema50_1h"])) &
