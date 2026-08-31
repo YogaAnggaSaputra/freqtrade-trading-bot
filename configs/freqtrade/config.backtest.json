@@ -1,0 +1,38 @@
+{
+    "timeframe": "5m",
+    "dry_run": true,
+    "trading_mode": "futures",
+    "margin_mode": "isolated",
+    "exchange": {
+        "name": "binanceusdm",
+        "pair_whitelist": [
+            "WLD/USDT:USDT", "PUMP/USDT:USDT", "ACE/USDT:USDT", "AIO/USDT:USDT",
+            "BEAT/USDT:USDT", "RIVER/USDT:USDT", "VVV/USDT:USDT", "1000RATS/USDT:USDT",
+            "ACU/USDT:USDT", "APR/USDT:USDT", "BLESS/USDT:USDT", "GALA/USDT:USDT",
+            "HUMA/USDT:USDT", "LIT/USDT:USDT", "ONG/USDT:USDT", "PRL/USDT:USDT",
+            "SKYAI/USDT:USDT", "SPX/USDT:USDT", "USELESS/USDT:USDT", "ZAMA/USDT:USDT",
+            "BTC/USDT:USDT"
+        ],
+        "pair_blacklist": []
+    },
+    "timeframe": "5m",
+    "max_open_trades": 10,
+    "stake_currency": "USDT",
+    "stake_amount": 100,
+    "tradable_balance_ratio": 0.99,
+    "fiat_display_currency": "USD",
+    "dry_run_wallet": 1000,
+    "cancel_open_orders_on_exit": true,
+    "unfilledtimeout": {"entry": 5, "exit": 15, "exit_timeout_count": 3, "unit": "minutes"},
+    "entry_pricing": {"price_side": "same", "use_order_book": true, "order_book_top": 1},
+    "exit_pricing": {"price_side": "same", "use_order_book": true, "order_book_top": 1},
+    "exchange_name": "binanceusdm",
+    "pairlists": [
+        {"method": "StaticPairList"}
+    ],
+    "strategy": "AITradingStrategy",
+    "strategy_path": "/freqtrade/configs/strategies",
+    "user_data_dir": "/freqtrade/user_data",
+    "dataformat_ohlcv": "feather",
+    "startup_candle_count": 300
+}

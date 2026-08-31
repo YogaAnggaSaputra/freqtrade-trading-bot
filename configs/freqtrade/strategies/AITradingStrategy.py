@@ -709,7 +709,7 @@ class AITradingStrategy(IStrategy):
     adx_threshold        = IntParameter(20, 35, default=25, space="buy", optimize=True)
     volume_spike_factor  = DecimalParameter(1.2, 2.0, default=1.5, space="buy", optimize=True)
     min_conf_long        = IntParameter(40, 85, default=60, space="buy", optimize=True)
-    min_conf_short       = IntParameter(40, 85, default=60, space="sell", optimize=True)
+    min_conf_short       = IntParameter(40, 85, default=65, space="sell", optimize=True)
 
     # Max trade hold time (jam) sebelum flat trade di-force exit
     # Skala scalping: trade yang tidak bergerak 3 jam sudah tidak produktif.
@@ -1060,6 +1060,7 @@ class AITradingStrategy(IStrategy):
             (dataframe["fomo_lock"]          == 0)         &  # Gate 2: No FOMO
             (dataframe["regime_macro"]       != "TRENDING_BEAR")  &  # Gate 3: Macro (D1)
             (dataframe["regime_tactical"]    != "TRENDING_BEAR")  &  # Gate 3a: Tactical (1H) — anti-trend pullback
+            (dataframe["regime"]             != "CHOPPY")          &  # Gate 3b: [P3] RANGING+CHOPPY + LONG = sel terburuk (WR 28%, net -0.85)
             # Gate 3b: Anti-bearish tactical — blokir LONG kalau BTC 1h bearish
             # konsensus 2/2: RSI < 40 DAN close < EMA50 (bukan 1 sinyal)
             (dataframe["btc_rsi_1h"].ge(40) | dataframe["btc_close_1h"].ge(dataframe["btc_ema50_1h"])) &
@@ -2043,15 +2044,22 @@ class AITradingStrategy(IStrategy):
         # [HARDEN] Fail-closed: kalau model-inference down/error/timeout,
         # entry DIBLOKIR. ML adalah konfirmasi penting; masuk tanpa ML saat
         # market tidak normal = risiko loss-streak (persis akar masalah lama).
-        ml_result = _fetch_ml_prediction(pair, dataframe, side, self)
-        if ml_result is None:
-            logger.info(
-                f"[{pair}] REJECTED: ML service unavailable (fail-closed) — "
-                f"entry blocked sampai ML respons"
-            )
-            return False
-        ml_signal = str(ml_result.get("signal", "HOLD")).upper()
-        ml_prob   = float(ml_result.get("probability", 0.5))
+        # NOTE: di backtest/hyperopt ML nonaktif → gate di-skip, bukan fail-closed
+        # (kalau tidak, semua entry keblokir karena _fetch_ml_prediction
+        # return None saat ML disabled).
+        # HOLD default saat ML disabled / tidak tersedia → tidak memblokir entry.
+        ml_signal = "HOLD"
+        ml_prob   = 0.5
+        if _ml_enabled(self):
+            ml_result = _fetch_ml_prediction(pair, dataframe, side, self)
+            if ml_result is None:
+                logger.info(
+                    f"[{pair}] REJECTED: ML service unavailable (fail-closed) — "
+                    f"entry blocked sampai ML respons"
+                )
+                return False
+            ml_signal = str(ml_result.get("signal", "HOLD")).upper()
+            ml_prob   = float(ml_result.get("probability", 0.5))
         if side == "long" and ml_signal == "SELL":
             logger.info(
                 f"[{pair}] REJECTED: ML signal SELL (prob {ml_prob:.2f}) vs long intent"
