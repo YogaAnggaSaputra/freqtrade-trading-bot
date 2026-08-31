@@ -520,7 +520,7 @@ services:
       context: .
       dockerfile: services/quant-engine/Dockerfile
     ports:
-      - "8021:8000"
+      - "127.0.0.1:8021:8000"
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://botbinance:${DB_PASSWORD:-changeme}@postgres:5432/botbinance}
     depends_on:
@@ -532,7 +532,7 @@ services:
       context: .
       dockerfile: services/sentiment-engine/Dockerfile
     ports:
-      - "8022:8000"
+      - "127.0.0.1:8022:8000"
     environment:
       CRYPTOPANIC_API_KEY: ${CRYPTOPANIC_API_KEY:-}
       TELEGRAM_SENTIMENT_BOT_TOKEN: ${TELEGRAM_SENTIMENT_BOT_TOKEN:-}
@@ -545,7 +545,7 @@ services:
       context: .
       dockerfile: services/on-chain-engine/Dockerfile
     ports:
-      - "8020:8000"
+      - "127.0.0.1:8020:8000"
     environment:
       ONCHAIN_DATA_PROVIDER_URL: ${ONCHAIN_DATA_PROVIDER_URL:-}
       ONCHAIN_DATA_PROVIDER_API_KEY: ${ONCHAIN_DATA_PROVIDER_API_KEY:-}
@@ -556,7 +556,7 @@ services:
       context: .
       dockerfile: services/tick-recorder/Dockerfile
     ports:
-      - "8023:8000"
+      - "127.0.0.1:8023:8000"
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://botbinance:${DB_PASSWORD:-changeme}@postgres:5432/botbinance}
     depends_on:
@@ -568,7 +568,7 @@ services:
       context: .
       dockerfile: services/anomaly-detection/Dockerfile
     ports:
-      - "8024:8000"
+      - "127.0.0.1:8024:8000"
 
   adaptive-whitelist:
     restart: unless-stopped
@@ -576,7 +576,7 @@ services:
       context: .
       dockerfile: services/adaptive-whitelist/Dockerfile
     ports:
-      - "8025:8000"
+      - "127.0.0.1:8025:8000"
     environment:
       DB_HOST: postgres
       DB_PORT: 5432
@@ -594,7 +594,7 @@ services:
       context: .
       dockerfile: services/execution-guard/Dockerfile
     ports:
-      - "8026:8000"
+      - "127.0.0.1:8026:8000"
 
   execution-quality:
     restart: unless-stopped
@@ -602,7 +602,7 @@ services:
       context: .
       dockerfile: services/execution-quality/Dockerfile
     ports:
-      - "8027:8000"
+      - "127.0.0.1:8027:8000"
 
   capital-allocation:
     restart: unless-stopped
@@ -610,7 +610,7 @@ services:
       context: .
       dockerfile: services/capital-allocation/Dockerfile
     ports:
-      - "8028:8000"
+      - "127.0.0.1:8028:8000"
 
   performance-attribution:
     restart: unless-stopped
@@ -618,7 +618,7 @@ services:
       context: .
       dockerfile: services/performance-attribution/Dockerfile
     ports:
-      - "8029:8000"
+      - "127.0.0.1:8029:8000"
     depends_on:
       - postgres
     environment:
@@ -634,7 +634,7 @@ services:
       context: .
       dockerfile: services/position-monitor/Dockerfile
     ports:
-      - "8030:8000"
+      - "127.0.0.1:8030:8000"
     environment:
       DB_HOST: postgres
       DB_PORT: 5432
@@ -651,7 +651,7 @@ services:
       context: .
       dockerfile: services/news-alpha/Dockerfile
     ports:
-      - "8031:8000"
+      - "127.0.0.1:8031:8000"
     environment:
       NEWS_LLM_ENABLED: ${NEWS_LLM_ENABLED:-false}
       NEWS_LLM_URL: ${NEWS_LLM_URL:-http://ollama:11434/api/generate}
@@ -665,7 +665,7 @@ services:
       context: .
       dockerfile: services/post-exit-regret/Dockerfile
     ports:
-      - "8032:8000"
+      - "127.0.0.1:8032:8000"
     environment:
       DB_HOST: ${DB_HOST:-postgres}
       DB_PORT: ${DB_PORT:-5432}
@@ -707,7 +707,7 @@ services:
       context: .
       dockerfile: services/orderbook-intelligence/Dockerfile
     ports:
-      - "8033:8000"
+      - "127.0.0.1:8033:8000"
 
   predictive-layer:
     restart: unless-stopped
@@ -715,7 +715,7 @@ services:
       context: .
       dockerfile: services/predictive-layer/Dockerfile
     ports:
-      - "8034:8000"
+      - "127.0.0.1:8034:8000"
 
   prometheus:
     image: prom/prometheus:v2.53.0
