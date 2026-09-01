@@ -39,6 +39,7 @@ from shared.quant.position import position_health, exit_consensus
 from shared.quant.allocation import exposure_multiplier
 from shared.quant.correlation import pearson, average_correlation
 from shared.quant.predictive import measured_move, liquidity_levels
+from shared.quant.stochastic import hurst_exponent
 
 logger = logging.getLogger(__name__)
 
@@ -1061,6 +1062,18 @@ class AITradingStrategy(IStrategy):
         ml_long_ok  = dataframe["ml_signal_direction"].isna() | (dataframe["ml_signal_direction"] != "SELL")
         ml_short_ok = dataframe["ml_signal_direction"].isna() | (dataframe["ml_signal_direction"] != "BUY")
 
+        # Gate 3c: Hurst regime filter — vectorized, cuma hitung sekali per candle.
+        # H < 0.45 = mean-reverting/ranging → skip entry trend-following.
+        # Window 64 baris 1h (≈64 jam), min 32 baris agar stabil.
+        hurst_window = 64
+        hurst_min_periods = 32
+        returns_1h = dataframe["close_1h"].pct_change()
+        dataframe["hurst_1h"] = (
+            returns_1h.rolling(hurst_window, min_periods=hurst_min_periods)
+            .apply(lambda x: hurst_exponent(x.dropna().tolist()), raw=False)
+        )
+        dataframe["hurst_1h"] = dataframe["hurst_1h"].fillna(0.5)
+
         # === LONG ===
         long_gates = (
             (dataframe["in_killzone"]        == 1)         &  # Gate 1: Kill zone
@@ -1068,6 +1081,8 @@ class AITradingStrategy(IStrategy):
             (dataframe["regime_macro"]       != "TRENDING_BEAR")  &  # Gate 3: Macro (D1)
             (dataframe["regime_tactical"]    != "TRENDING_BEAR")  &  # Gate 3a: Tactical (1H) — anti-trend pullback
             (dataframe["regime_tactical"]    != "RANGING")         &  # Gate 3b: [P3] RANGING/CHOPPY 1H + LONG = sel terburuk (WR 28%, net -0.85) — butuh arah 1H jelas
+            # Gate 3c: Hurst regime — H < 0.45 = mean-reverting, tolak entry trend-following
+            (dataframe["hurst_1h"].ge(0.45)) &
             # Gate 3b: Anti-bearish tactical — blokir LONG kalau BTC 1h bearish
             # konsensus 2/2: RSI < 40 DAN close < EMA50 (bukan 1 sinyal)
             (dataframe["btc_rsi_1h"].ge(40) | dataframe["btc_close_1h"].ge(dataframe["btc_ema50_1h"])) &
@@ -1085,6 +1100,7 @@ class AITradingStrategy(IStrategy):
             (dataframe["fomo_lock"]          == 0)         &
             (dataframe["regime_macro"]       != "TRENDING_BULL")  &  # Gate 3: Macro (D1)
             (dataframe["regime_tactical"]    != "TRENDING_BULL")  &  # Gate 3a: Tactical (1H)
+            (dataframe["hurst_1h"].ge(0.45)) &  # Gate 3c: Hurst — tolak mean-reverting
             # Gate 3b symmetric: blokir SHORT kalau BTC 1h bullish kuat
             # konsensus 2/2: RSI > 60 DAN close > EMA50
             (dataframe["btc_rsi_1h"].le(60) | dataframe["btc_close_1h"].le(dataframe["btc_ema50_1h"])) &
