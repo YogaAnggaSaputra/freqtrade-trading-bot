@@ -1734,11 +1734,9 @@ class AITradingStrategy(IStrategy):
                 Trade.close_date >= today_start,
                 Trade.is_open.is_(False),
             ]).all()
-            recent = [t for t in closed_today
-                      if t.close_profit_abs is not None and t.close_profit_abs < 0]
             # Hitung beruntun dari trade terakhir mundur
             consecutive = 0
-            for t in sorted(closed_today, key=lambda x: x.close_date or x.close_date_utc, reverse=True):
+            for t in sorted(closed_today, key=lambda x: x.close_date, reverse=True):
                 if t.close_profit_abs is not None and t.close_profit_abs < 0:
                     consecutive += 1
                 else:
@@ -2189,7 +2187,7 @@ class AITradingStrategy(IStrategy):
                 Trade.is_open.is_(False),
             ]).all()
             consecutive_today = 0
-            for t in sorted(closed_today, key=lambda x: x.close_date or x.close_date_utc, reverse=True):
+            for t in sorted(closed_today, key=lambda x: x.close_date, reverse=True):
                 if t.close_profit_abs is not None and t.close_profit_abs < 0:
                     consecutive_today += 1
                 else:
