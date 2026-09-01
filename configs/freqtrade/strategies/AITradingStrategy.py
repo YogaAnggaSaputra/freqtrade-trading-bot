@@ -1212,18 +1212,20 @@ class AITradingStrategy(IStrategy):
         # [LINK-OUTCOME] Persist I(t) orderbook probe ke trade record (biar
         # pas closed nanti, nilai imbalance nempel di trade yang sama — gak
         # perlu grep log manual). Ambil dari _pending_imbalance (di-set di
-        # confirm_trade_entry). max_open_trades=1 → aman.
+        # confirm_trade_entry). max_open_trades=10 → dict per-pair.
         try:
-            if getattr(self, "_pending_imbalance", None):
+            entry = getattr(self, "_pending_imbalance", {}).get(pair)
+            if entry:
                 CustomDataWrapper.set_custom_data(
                     trade.id, "entry_imbalance",
-                    float(self._pending_imbalance["imb"]))
-                self._pending_imbalance = None
-            if getattr(self, "_pending_orderbook", None) and trade.id is not None:
+                    float(entry["imb"]))
+                self._pending_imbalance[pair] = None
+            entry = getattr(self, "_pending_orderbook", {}).get(pair)
+            if entry and trade.id is not None:
                 CustomDataWrapper.set_custom_data(
                     trade.id, "entry_orderbook_intelligence",
-                    dict(self._pending_orderbook))
-                self._pending_orderbook = None
+                    dict(entry))
+                self._pending_orderbook[pair] = None
         except Exception as exc:
             logger.debug(f"[{pair}] orderbook telemetry persist skipped: {exc}")
 
@@ -2366,15 +2368,18 @@ class AITradingStrategy(IStrategy):
                 )
                 # [LINK-OUTCOME] Simpan sementara → di-persist ke CustomDataWrapper
                 # saat custom_stoploss after_fill (trade.id baru ADA di situ).
-                # max_open_trades=1 → aman 1 pending aja. ponytail: upgrade ke
-                # dict per-pair kalau max_open_trades>1.
-                self._pending_imbalance = {"imb": float(imb), "ts": str(current_time)}
+                # max_open_trades=10 → dict per-pair.
+                if not hasattr(self, "_pending_imbalance") or self._pending_imbalance is None:
+                    self._pending_imbalance = {}
+                self._pending_imbalance[pair] = {"imb": float(imb), "ts": str(current_time)}
                 if os.getenv("ORDERBOOK_GATE_ENABLED", "false").lower() == "true" and abs(imb) >= float(os.getenv("ORDERBOOK_GATE_MIN_IMBALANCE", "0.08")) and not side_ok:
                     logger.info(f"[{pair}] REJECTED: orderbook imbalance contra intent ({imb:+.3f})")
                     return False
                 intelligence = _orderbook_intelligence(pair, book)
                 if intelligence:
-                    self._pending_orderbook = intelligence
+                    if not hasattr(self, "_pending_orderbook") or self._pending_orderbook is None:
+                        self._pending_orderbook = {}
+                    self._pending_orderbook[pair] = intelligence
                     spoofing = float(intelligence.get("spoofing_score", 0.0) or 0.0)
                     if (os.getenv("ORDERBOOK_GATE_ENABLED", "false").lower() == "true" and
                             spoofing > float(os.getenv("ORDERBOOK_SPOOFING_MAX", "0.70"))):
@@ -2406,7 +2411,7 @@ class AITradingStrategy(IStrategy):
                 "strategy_version": "AITradingStrategy",
             }
             try:
-                loop = _asyncio.get_event_loop()
+                loop = _asyncio.get_running_loop()
             except RuntimeError:
                 loop = _asyncio.new_event_loop()
                 _asyncio.set_event_loop(loop)
@@ -2546,7 +2551,7 @@ class AITradingStrategy(IStrategy):
             import asyncio as _asyncio
             from shared.feedback import emit_trade_closed
             try:
-                loop = _asyncio.get_event_loop()
+                loop = _asyncio.get_running_loop()
                 if loop.is_running():
                     loop.create_task(emit_trade_closed(outcome))
                 else:
