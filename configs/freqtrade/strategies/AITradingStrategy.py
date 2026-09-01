@@ -206,7 +206,20 @@ def _sentiment(pair: str) -> dict:
 
 
 def _onchain_metrics(pair: str) -> dict:
+    """Fetch on-chain metrics from the on-chain engine (fail-open)."""
     if not ON_CHAIN_ENGINE_ENABLED:
+        return {}
+    cached = _onchain_cache.get(pair)
+    if cached and time.time() - cached.get("ts", 0) < 30:
+        return cached.get("data", {})
+    try:
+        req = Request(f"{ON_CHAIN_ENGINE_URL}/metrics/{pair.replace('/', '')}",
+                      headers={"Accept": "application/json"})
+        with urlopen(req, timeout=0.35) as response:  # noqa: S310
+            data = json.loads(response.read().decode("utf-8")) if response.status == 200 else {}
+        _onchain_cache[pair] = {"ts": time.time(), "data": data}
+        return data if isinstance(data, dict) else {}
+    except Exception:
         return {}
 
 
@@ -239,18 +252,6 @@ def _orderbook_intelligence(pair: str, book: dict) -> dict:
         with urlopen(req, timeout=0.25) as response:  # noqa: S310
             result = json.loads(response.read().decode("utf-8")) if response.status == 200 else {}
         return result if isinstance(result, dict) else {}
-    except Exception:
-        return {}
-    cached = _onchain_cache.get(pair)
-    if cached and time.time() - cached.get("ts", 0) < 30:
-        return cached.get("data", {})
-    try:
-        req = Request(f"{ON_CHAIN_ENGINE_URL}/metrics/{pair.replace('/', '')}",
-                      headers={"Accept": "application/json"})
-        with urlopen(req, timeout=0.35) as response:  # noqa: S310
-            data = json.loads(response.read().decode("utf-8")) if response.status == 200 else {}
-        _onchain_cache[pair] = {"ts": time.time(), "data": data}
-        return data
     except Exception:
         return {}
 
@@ -339,7 +340,12 @@ def _ml_call(url_path: str, payload: dict) -> dict | None:
         except RuntimeError:
             return asyncio.run(_do())
         else:
-            return asyncio.get_event_loop().run_until_complete(_do())
+            # Live mode: running loop exists — run aiohttp in a worker thread
+            # so we never touch the running loop (run_until_complete would
+            # raise RuntimeError "event loop already running").
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(asyncio.run, _do()).result(timeout=4)
     except Exception as e:  # noqa: BLE001
         logger.debug("[ML] call failed %s: %s", url_path, e)
         return None
@@ -759,7 +765,8 @@ class AITradingStrategy(IStrategy):
         # Coin baru tanpa data 1d cukup → df kosong → merger throw "empty dataframe".
         # Guard: isi 1 baris NaN → merger OK, semua kolom NaN → no signal (skip pair).
         if dataframe.empty:
-            dataframe.loc[0] = [float("nan")] * len(dataframe.columns)
+            # Gunakan assign row dengan iloc — aman untuk DatetimeIndex
+            dataframe = dataframe.assign(**{col: float("nan") for col in dataframe.columns})
             return dataframe
         dataframe["ema50"]      = ta.EMA(dataframe["close"], 50)
         dataframe["ema200"]     = ta.EMA(dataframe["close"], 200)
@@ -1270,6 +1277,7 @@ class AITradingStrategy(IStrategy):
             logger.debug(f"[{pair}] SL floor override: {sl_pct:.2%} → 1.5%")
             sl_pct = 0.015
         one_r     = float(sl_pct) * open_rate    # 1R dalam harga absolute (konsisten)
+        sl_dist_eff = max(sl_dist, open_rate * 0.015)  # default floor, overridden by struct below
 
         # Hitung current profit dalam harga absolute
         if trade.is_short:
@@ -1614,8 +1622,8 @@ class AITradingStrategy(IStrategy):
         # TP1: quant-engine calibrated R level → close adaptive percentage
         if not state["tp1"] and r_multiple >= tp1_rrr:
             state["tp1"] = True
-            close_stake = trade.stake_amount * tp1_close_pct
-            logger.info(f"[{pair}] TP1 hit ({r_multiple:.2f}R) → close {tp1_close_pct:.0%}")
+            close_stake = max(min_stake or 0.01, trade.stake_amount * tp1_close_pct)
+            logger.info(f"[{pair}] TP1 hit ({r_multiple:.2f}R) → close {tp1_close_pct:.0%} (stake capped to min {min_stake})")
             # Persist state biar gak reset kalau restart bot (DB native)
             try:
                 CustomDataWrapper.set_custom_data(trade.id, "tp1_done", True)
@@ -1628,8 +1636,8 @@ class AITradingStrategy(IStrategy):
         # TP2: quant-engine calibrated R level → close adaptive percentage
         if not state["tp2"] and r_multiple >= tp2_rrr:
             state["tp2"] = True
-            close_stake = trade.stake_amount * tp2_close_pct
-            logger.info(f"[{pair}] TP2 hit ({r_multiple:.2f}R) → close {tp2_close_pct:.0%}")
+            close_stake = max(min_stake or 0.01, trade.stake_amount * tp2_close_pct)
+            logger.info(f"[{pair}] TP2 hit ({r_multiple:.2f}R) → close {tp2_close_pct:.0%} (stake capped to min {min_stake})")
             try:
                 CustomDataWrapper.set_custom_data(trade.id, "tp2_done", True)
             except Exception:
