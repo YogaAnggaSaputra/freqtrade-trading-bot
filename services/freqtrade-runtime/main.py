@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Freqtrade Runtime API")
 freqtrade_process: Optional[threading.Thread] = None
+_bot_lock = threading.Lock()
 bot_running = False
 bot_state = "stopped"
 
@@ -202,9 +203,15 @@ def create_config(mode: str) -> str:
         }
     }
     
-    config_path = f"/tmp/freqtrade_config_{uuid.uuid4().hex}.json"
-    with open(config_path, 'w') as f:
+    # [SECURITY] Jangan simpan API key/secret di /tmp plaintext permanen.
+    # Tulis config ke memori (StringIO) dan beri signal ke subprocess via env,
+    # bukan file disk. Freqtrade butuh path file — jadi tulis dengan mode 600
+    # dan hapus segera setelah subprocess selesai (finally).
+    import tempfile
+    fd, config_path = tempfile.mkstemp(prefix="freqtrade_config_", suffix=".json")
+    with os.fdopen(fd, "w") as f:
         json.dump(config, f, indent=2)
+    os.chmod(config_path, 0o600)
     return config_path
 
 def run_freqtrade(config_path: str):
@@ -228,15 +235,30 @@ def run_freqtrade(config_path: str):
         universal_newlines=True,
         bufsize=1,
     )
-    while proc.poll() is None:
-        line = proc.stdout.readline()
-        if line:
-            logger.info(f"FREQTRADE: {line.strip()}")
-    logger.info(f"Freqtrade exited with code {proc.returncode}")
-    global bot_running, bot_state
-    bot_running = False
-    bot_state = "stopped" if proc.returncode == 0 else "error"
-    freqtrade_process = None
+    # Attach proc ke thread agar /stop bisa graceful terminate (bukan pkill SIGKILL)
+    with _bot_lock:
+        freqtrade_process = threading.current_thread()
+        freqtrade_process.proc = proc  # type: ignore[attr-defined]
+    try:
+        while proc.poll() is None:
+            line = proc.stdout.readline()
+            if line:
+                logger.info(f"FREQTRADE: {line.strip()}")
+        logger.info(f"Freqtrade exited with code {proc.returncode}")
+        global bot_running, bot_state
+        bot_running = False
+        bot_state = "stopped" if proc.returncode == 0 else "error"
+    finally:
+        # [SECURITY] Hapus config file (berisi API key/secret) setelah bot selesai.
+        # Jangan biarkan kredensial plaintext permanen di /tmp.
+        try:
+            if config_path and os.path.exists(config_path):
+                os.remove(config_path)
+                logger.info("Cleaned up temp config %s", config_path)
+        except Exception as exc:
+            logger.warning("Failed to clean up temp config: %s", exc)
+        with _bot_lock:
+            freqtrade_process = None
 
 @app.get("/health")
 async def health():
@@ -277,8 +299,15 @@ async def stop_bot():
     global freqtrade_process, bot_running, bot_state
     if freqtrade_process is None:
         return {"status": "not_running"}
-    os.system("pkill -f 'python.*freqtrade' 2>/dev/null")
-    freqtrade_process.join(timeout=10)
+    proc = getattr(freqtrade_process, "proc", None)
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=20)
+        except Exception as exc:
+            logger.warning("Graceful stop failed: %s", exc)
+            if proc.poll() is None:
+                proc.kill()
     bot_running = False
     bot_state = "stopped"
     return {"status": "stopped"}

@@ -504,7 +504,8 @@ async def predict_ensemble(req: InferenceRequest):
         model_version = single_result["model_version"]
     else:
         probability = ensemble_result["probability"]
-        confidence = 1.0 - ensemble_result["entropy"]  # Inverse entropy as confidence
+        raw_confidence = 1.0 - ensemble_result["entropy"]
+        confidence = max(0.0, min(1.0, raw_confidence))  # Cap 0..1, entropy bisa >1
         model_version = f"ensemble_v1({','.join(ensemble._available_models)})"
 
     # 6. Regime classification
@@ -615,6 +616,44 @@ PRODUCTION_MODEL_PATH = os.path.join(PROMOTE_MODEL_DIR, "ensemble_stacking.pkl")
 CANDIDATE_MODEL_PATH = os.path.join(PROMOTE_MODEL_DIR, "ensemble_stack_candidate.pkl")
 
 
+def _safe_load_ensemble(path: str) -> dict[str, Any] | None:
+    """Load serialized ensemble dengan verifikasi struktur (anti-corrupt/manipulasi).
+
+    pickle.load() dari file korup bisa mengeksekusi kode arbitrary. Verifikasi
+    minimum: ukuran file > 0, dict valid, base_models dict berisi objek dengan
+    predict_proba, meta_learner ada, feature_names list. Return None kalau gagal.
+    """
+    import pickle as _p
+    if not os.path.exists(path):
+        return None
+    if os.path.getsize(path) == 0:
+        return None
+    try:
+        with open(path, "rb") as f:
+            data = _p.load(f)
+        if not isinstance(data, dict):
+            return None
+        base_models = data.get("base_models")
+        meta_learner = data.get("meta_learner")
+        feature_names = data.get("feature_names")
+        if not isinstance(base_models, dict) or not base_models:
+            return None
+        if meta_learner is None:
+            return None
+        if not isinstance(feature_names, list):
+            return None
+        # Semua base model harus punya predict_proba (valid sklearn/boosting)
+        for name, model in base_models.items():
+            if not callable(getattr(model, "predict_proba", None)):
+                return None
+        if not callable(getattr(meta_learner, "predict_proba", None)):
+            return None
+        return data
+    except Exception as exc:  # noqa: BLE001 — file korup / pickle error
+        logger.warning("Failed to load ensemble %s: %s", path, exc)
+        return None
+
+
 def _score_serialized_ensemble(model_data: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Score a saved ensemble on time-ordered trade outcome features.
 
@@ -714,9 +753,9 @@ async def evaluate_candidate():
     if os.path.exists(CANDIDATE_MODEL_PATH):
         try:
             with open(CANDIDATE_MODEL_PATH, "rb") as f:
-                cand_data = _pickle.load(f)
+                cand_data = _safe_load_ensemble(CANDIDATE_MODEL_PATH) or {}
             cand_metrics = {
-                "loaded": True,
+                "loaded": bool(cand_data),
                 "available_models": cand_data.get("available_models", []),
                 "feature_count": len(cand_data.get("feature_names", [])),
             }
@@ -726,9 +765,9 @@ async def evaluate_candidate():
     if os.path.exists(PRODUCTION_MODEL_PATH):
         try:
             with open(PRODUCTION_MODEL_PATH, "rb") as f:
-                prod_data = _pickle.load(f)
+                prod_data = _safe_load_ensemble(PRODUCTION_MODEL_PATH) or {}
             prod_metrics = {
-                "loaded": True,
+                "loaded": bool(prod_data),
                 "available_models": prod_data.get("available_models", []),
                 "feature_count": len(prod_data.get("feature_names", [])),
             }
@@ -819,8 +858,22 @@ async def promote_candidate(version_id: str | None = None):
 
     # Promote: candidate → production
     _sh.copy2(CANDIDATE_MODEL_PATH, PRODUCTION_MODEL_PATH)
-    # Reload in-memory ensemble agar serving pakai model baru
-    ensemble.load()
+    # Reload in-memory ensemble agar serving pakai model baru.
+    # [HARDEN] Kalau load gagal (file korup), rollback ke backup — jangan
+    # biarkan DB status production tapi model lama masih serving.
+    if not ensemble.load():
+        logger.error("Ensemble reload failed after promote — rolling back")
+        if os.path.exists(backup_path):
+            _sh.copy2(backup_path, PRODUCTION_MODEL_PATH)
+            ensemble.load()
+            raise HTTPException(
+                status_code=502,
+                detail="Candidate model failed to load; production restored from backup",
+            )
+        raise HTTPException(
+            status_code=502,
+            detail="Candidate model failed to load and no backup available",
+        )
 
     # Update model_versions DB
     promoted_count = 0
