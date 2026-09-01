@@ -26,7 +26,7 @@ async def poll():
                     if not command or command[0].lower() not in {"/killswitch", "/kill"}: continue
                     level = command[1].lower() if len(command) > 1 else "black"
                     if level not in {"yellow", "orange", "red", "black", "green"}: continue
-                    async with session.post(f"{RISK_URL}/killswitch", params={"level": level, "reason": "telegram-control", "pin": KILL_SWITCH_PIN}) as result:
+                    async with session.post(f"{RISK_URL}/killswitch", json={"level": level, "reason": "telegram-control", "pin": KILL_SWITCH_PIN}) as result:
                         await result.read()
             except asyncio.CancelledError: raise
             except Exception:

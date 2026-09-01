@@ -58,13 +58,15 @@ def _split_batches(symbols: list[str], batch_size: int) -> list[list[str]]:
 async def get_candles_async(pair: str, timeframe: str, limit: int = 10):
     import asyncpg
     
-    pool = await asyncpg.create_pool(
-        host=os.getenv("DB_HOST", "postgres"),
-        database=os.getenv("DB_NAME", "botbinance"),
-        user=os.getenv("DB_USER", "botbinance"),
-        password=os.getenv("DB_PASSWORD", "changeme"),
-        port=int(os.getenv("DB_PORT", "5432")),
-    )
+    global _candle_pool
+    if _candle_pool is None:
+        _candle_pool = await asyncpg.create_pool(
+            host=os.getenv("DB_HOST", "postgres"),
+            database=os.getenv("DB_NAME", "botbinance"),
+            user=os.getenv("DB_USER", "botbinance"),
+            password=os.getenv("DB_PASSWORD", "changeme"),
+            port=int(os.getenv("DB_PORT", "5432")),
+        )
     
     try:
         normalized = _normalize_pair(pair)
@@ -75,7 +77,7 @@ async def get_candles_async(pair: str, timeframe: str, limit: int = 10):
             ORDER BY timestamp DESC
             LIMIT $3
         """
-        rows = await pool.fetch(sql, normalized, timeframe, limit)
+        rows = await _candle_pool.fetch(sql, normalized, timeframe, limit)
         return [
             {
                 "timestamp": str(row["timestamp"]),
@@ -87,8 +89,16 @@ async def get_candles_async(pair: str, timeframe: str, limit: int = 10):
             }
             for row in rows
         ]
-    finally:
-        await pool.close()
+    except Exception:
+        # Pool broken → reset so next call recreates it
+        if _candle_pool is not None:
+            try: await _candle_pool.close()
+            except Exception: pass
+            _candle_pool = None
+        raise
+
+
+_candle_pool = None
 
 
 class MarketDataGateway:
@@ -217,16 +227,6 @@ class MarketDataGateway:
             except Exception as e:
                 logger.error(f"REST poll error: {e}")
                 await asyncio.sleep(10)
-                logger.info(f"WebSocket batch {batch_index} connected")
-                async for message in ws:
-                    if not self._running:
-                        break
-                    data = json.loads(message)
-                    await self._handle_message(data)
-            except Exception as e:
-                logger.error(f"WebSocket batch {batch_index} error", error=str(e))
-                if self._running:
-                    await asyncio.sleep(5)
 
     async def _handle_message(self, data: dict):
         if "stream" not in data or "data" not in data:
@@ -453,12 +453,12 @@ class MarketDataGateway:
             self._last_snapshots.clear()
 
     async def _touch_market_freshness(self, symbol: str):
-        """Update Redis freshness key (async-safe sync redis call)."""
+        """Update Redis freshness key (async)."""
         try:
-            import redis
+            import redis.asyncio as aioredis
             global redis_client
             if redis_client is None:
-                redis_client = redis.Redis(
+                redis_client = aioredis.Redis(
                     host=os.getenv("REDIS_HOST", "redis"),
                     port=int(os.getenv("REDIS_PORT", 6379)),
                     password=os.getenv("REDIS_PASSWORD", "changeme"),
@@ -466,7 +466,7 @@ class MarketDataGateway:
                 )
             normalized = symbol.upper().split("/")[0].replace(":", "")
             key = f"market:last_update:{normalized}"
-            redis_client.set(key, str(datetime.utcnow()), ex=300)
+            await redis_client.set(key, str(datetime.utcnow()), ex=300)
         except Exception as e:
             logger.warning("Failed to update freshness", error=str(e), symbol=symbol)
 

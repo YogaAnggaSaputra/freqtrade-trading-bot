@@ -320,27 +320,20 @@ class RiskGateway:
         )
 
     async def check_daily_loss(self, equity: Decimal | None = None) -> CheckResult:
-        """Cek daily loss pct. equity = total wallet balance dari Binance (atau fallback)."""
+        """Cek net P&L harian. equity = total wallet balance (atau fallback)."""
         import os
         base_equity = equity or Decimal(os.getenv("EQUITY_FALLBACK_USDT", "10000"))
         async with AsyncSessionLocal() as db:
             today = datetime.now(UTC).date()
-            # Kolom closed_at di DB bertipe `timestamp without time zone` (naive).
-            # Jangan set tzinfo — asyncpg gagal encode aware datetime ke kolom
-            # naive (DataError: can't subtract offset-naive and offset-aware).
             start = datetime.combine(today, datetime.min.time())
 
             result = await db.execute(
                 select(func.sum(TradeDossier.realized_pnl)).where(
-                    and_(
-                        TradeDossier.closed_at >= start,
-                        TradeDossier.realized_pnl < 0
-                    )
+                    TradeDossier.closed_at >= start,
                 )
             )
-            daily_loss = result.scalar() or Decimal("0")
+            daily_net_pnl = result.scalar() or Decimal("0")
 
-            # starting_equity = saldo real + akumulasi PnL sebelum hari ini
             equity_result = await db.execute(
                 select(func.coalesce(func.sum(TradeDossier.realized_pnl), 0)).where(
                     TradeDossier.closed_at < start
@@ -348,15 +341,16 @@ class RiskGateway:
             )
             starting_equity = base_equity + (equity_result.scalar() or Decimal("0"))
 
-            loss_pct = abs(daily_loss) / starting_equity if starting_equity > 0 else Decimal("0")
-            if loss_pct >= Decimal(str(self.policy.daily_loss_limit_pct)):
-                return CheckResult(
-                    name="daily_loss",
-                    passed=False,
-                    reason=f"Daily loss {loss_pct*100:.2f}% exceeds limit {self.policy.daily_loss_limit_pct*100}%",
-                    details={"daily_loss": str(daily_loss), "limit_pct": self.policy.daily_loss_limit_pct}
-                )
-        return CheckResult(name="daily_loss", passed=True, reason="Daily loss within limit")
+            if daily_net_pnl < 0:
+                loss_pct = abs(daily_net_pnl) / starting_equity if starting_equity > 0 else Decimal("0")
+                if loss_pct >= Decimal(str(self.policy.daily_loss_limit_pct)):
+                    return CheckResult(
+                        name="daily_loss",
+                        passed=False,
+                        reason=f"Daily loss {loss_pct*100:.2f}% exceeds limit {self.policy.daily_loss_limit_pct*100}%",
+                        details={"daily_net_pnl": str(daily_net_pnl), "limit_pct": self.policy.daily_loss_limit_pct}
+                    )
+        return CheckResult(name="daily_loss", passed=True, reason="Daily net P&L within limit")
 
     async def check_max_drawdown(self, equity: Decimal | None = None) -> CheckResult:
         """Cek max drawdown sepanjang history. equity = starting balance real."""
@@ -364,7 +358,9 @@ class RiskGateway:
         base_equity = equity or Decimal(os.getenv("EQUITY_FALLBACK_USDT", "10000"))
         async with AsyncSessionLocal() as db:
             result = await db.execute(
-                select(TradeDossier).order_by(TradeDossier.created_at)
+                select(TradeDossier)
+                .order_by(TradeDossier.created_at)
+                .limit(10000)  # Guard: prevent OOM on large DB
             )
             trades = result.scalars().all()
 
@@ -454,9 +450,14 @@ class RiskGateway:
         checks.append(await self.check_kill_switch())
         checks.append(await self.check_environment(trade_mode))
         checks.append(await self.check_pair_allowlist(pair))
-        checks.append(await self.check_reconciliation(pair))
         checks.append(await self.check_market_data_freshness(pair))
         checks.append(await self.check_critical_alerts())
+        # Guard murah (in-memory/network ringan) di depan sebelum DB queries mahal:
+        # kalau spread/macro/OBI blokir, tidak perlu buang DB round-trip.
+        checks.append(await self.check_spread_guard(pair=pair))    # Spread & volatility guard
+        checks.append(await self.check_macro_event())              # Macro news calendar block
+        checks.append(await self.check_obi(pair=pair, side=side))  # OBI liquidity check
+        checks.append(await self.check_reconciliation(pair))
 
         entry_price = price if price else Decimal("0")
         checks.append(await self.check_stop_loss_valid(stop_loss, entry_price, side))
@@ -487,9 +488,6 @@ class RiskGateway:
 
         checks.append(await self.check_daily_loss(equity=equity))
         checks.append(await self.check_max_drawdown(equity=equity))
-        checks.append(await self.check_obi(pair=pair, side=side))  # OBI liquidity check
-        checks.append(await self.check_macro_event())              # Macro news calendar block
-        checks.append(await self.check_spread_guard(pair=pair))    # Spread & volatility guard
         checks.append(await self.check_strategy_approved(strategy_version))
         checks.append(await self.check_config_consistency(strategy_version, config_version))
 

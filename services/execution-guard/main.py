@@ -25,7 +25,10 @@ async def validate(order: OrderCheck):
     if order.pending_same_order:
         reasons.append("duplicate_pending_order")
 
-    notional = order.amount * order.price * order.leverage
+    # Futures: min_notional filter Binance = order notional (qty × price).
+    # Leverage tidak mengubah notional — margin = notional / leverage.
+    # Rumus lama (× leverage) overstate notional → order kecil lolos check.
+    notional = order.amount * order.price
     if notional < order.min_notional:
         reasons.append("min_notional_not_met")
 

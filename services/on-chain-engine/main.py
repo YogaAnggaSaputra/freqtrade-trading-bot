@@ -31,6 +31,12 @@ async def _fetch(symbol: str) -> dict:
             else:
                 result["open_interest_delta_pct"] = 0.0
             _open_interest_history[symbol] = (time.time(), result["open_interest"])
+            # Cap memori: buang entry > 24 jam, jangan biarkan dict tumbuh tanpa batas.
+            if len(_open_interest_history) > 1000:
+                cutoff = time.time() - 86400
+                stale = [k for k, v in _open_interest_history.items() if v[0] < cutoff]
+                for k in stale:
+                    del _open_interest_history[k]
             result["data_quality"].append("binance_open_interest")
         except Exception:
             pass

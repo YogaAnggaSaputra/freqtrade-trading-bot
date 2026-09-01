@@ -7,6 +7,7 @@ from shared.db.models import PositionHealthSnapshot
 from shared.db.session import AsyncSessionLocal, close_db, init_db
 from shared.quant.position_risk import funding_impact, stress_loss, kill_switch_level
 from shared.quant.position import position_health
+from shared.quant.supreme_final import chandelier_exit_ratchet
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -15,7 +16,6 @@ async def lifespan(app: FastAPI):
     await close_db()
 
 app = FastAPI(title="Position Monitor", lifespan=lifespan)
-from shared.quant.supreme_final import chandelier_exit_ratchet
 
 class RiskRequest(BaseModel):
     notional: float; funding_rate: float = 0; funding_periods: int = 0

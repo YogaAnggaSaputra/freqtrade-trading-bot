@@ -72,8 +72,11 @@ class LossAnalyzer:
             return "regime_mismatch"
 
         # Cek timing (exit terlalu cepat setelah entry)
+        # Normalisasi tz-aware → naive UTC agar subtraction tidak crash.
         if dossier.created_at and dossier.closed_at:
-            hold_time = dossier.closed_at - dossier.created_at
+            created = dossier.created_at.replace(tzinfo=None) if dossier.created_at.tzinfo else dossier.created_at
+            closed = dossier.closed_at.replace(tzinfo=None) if dossier.closed_at.tzinfo else dossier.closed_at
+            hold_time = closed - created
             if hold_time.total_seconds() < 300:  # < 5 menit
                 return "poor_timing"
 
@@ -135,19 +138,20 @@ class LossAnalyzer:
         patterns = []
 
         async with AsyncSessionLocal() as db:
+            # Ambil semua trade (bukan cuma loss) agar streak bisa di-reset oleh winner.
+            # Kalau cuma loss data, streak = len(losses) → selalu false-positive.
             stmt = select(TradeDossier).where(
-                and_(
-                    TradeDossier.created_at >= since,
-                    TradeDossier.realized_pnl < 0,
-                )
+                TradeDossier.created_at >= since,
             )
             if strategy_version:
                 stmt = stmt.where(TradeDossier.strategy_version == strategy_version)
-            result = await db.execute(stmt)
-            losses = result.scalars().all()
+            result = await db.execute(stmt.order_by(TradeDossier.created_at))
+            all_trades = result.scalars().all()
 
-        if len(losses) < min_samples:
+        if len(all_trades) < min_samples:
             return []
+
+        losses = [d for d in all_trades if float(d.realized_pnl) < 0]
 
         # Pattern 1: Regime mismatch dominan
         regime_mismatch_count = sum(
@@ -173,11 +177,10 @@ class LossAnalyzer:
                 "recommendation": "Increase ATR multiplier for stop-loss placement",
             })
 
-        # Pattern 3: Loss streak
-        sorted_losses = sorted(losses, key=lambda d: d.created_at or datetime.min)
+        # Pattern 3: Loss streak — pakai all_trades (bukan loss-only) agar winner reset streak
         max_streak = 0
         current_streak = 0
-        for d in sorted_losses:
+        for d in all_trades:
             if float(d.realized_pnl) < 0:
                 current_streak += 1
                 max_streak = max(max_streak, current_streak)

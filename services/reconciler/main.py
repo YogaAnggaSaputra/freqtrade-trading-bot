@@ -59,11 +59,11 @@ async def reconcile_positions():
 async def reconcile_orders():
     async with AsyncSessionLocal() as db:
         result = await db.execute(
-            select(Order).where(Order.status.in_([
-                OrderStatusEnum.SUBMITTED, OrderStatusEnum.PARTIALLY_FILLED,
-                OrderStatusEnum.FILLED, OrderStatusEnum.PROTECTION_PENDING
-            ]))
-        )
+                    select(Order).where(Order.status.in_([
+                        OrderStatusEnum.SUBMITTED, OrderStatusEnum.PARTIALLY_FILLED,
+                        OrderStatusEnum.PROTECTION_PENDING
+                    ]))
+                )
         local_orders = result.scalars().all()
 
         if not local_orders:

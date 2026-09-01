@@ -207,12 +207,15 @@ async def get_checks():
 
 
 @app.post("/killswitch")
-async def set_kill_switch(level: str, reason: str = "Set via API", pin: str | None = None):
+async def set_kill_switch(payload: dict):
     """Set/reset kill switch level yang dibaca engine saat validasi trade.
 
-    level: yellow | orange | red | black | green (green = resume/normal).
-    Ini adalah sumber kebenaran yang sama dengan yang di-set discord-bot.
+    Body JSON: {"level": "yellow|orange|red|black|green", "reason": "...", "pin": "..."}
+    PIN via body, bukan query param — hindari leak di access log / proxy log.
     """
+    level = str(payload.get("level", ""))
+    reason = str(payload.get("reason", "Set via API"))
+    pin = payload.get("pin")
     valid = {"yellow", "orange", "red", "black", "green"}
     if level.lower() not in valid:
         raise HTTPException(status_code=400, detail=f"Invalid level: {level} (use {sorted(valid)})")

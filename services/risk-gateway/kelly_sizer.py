@@ -90,11 +90,15 @@ class KellySizer:
         win_rate, avg_win, avg_loss, trade_count = await KellySizer._fetch_trade_stats()
 
         # Bayesian Beta-Binomial Updating for conservative win-rate estimation
-        from shared.quant.calibration import beta_posterior
-        n_wins = int(win_rate * trade_count)
-        n_losses = trade_count - n_wins
-        post = beta_posterior(n_wins, n_losses)
-        conservative_win_rate = post["lower_ci_95"]  # Use lower bound of 95% credible interval
+        try:
+            from shared.quant.calibration import beta_posterior
+            n_wins = int(win_rate * trade_count)
+            n_losses = trade_count - n_wins
+            post = beta_posterior(n_wins, n_losses)
+            conservative_win_rate = post["lower_ci_95"]
+        except Exception as e:  # noqa: BLE001
+            logger.warning("calibration.beta_posterior unavailable: %s — using raw win rate", e)
+            conservative_win_rate = win_rate
 
         # Insufficient data → defensive minimum
         if trade_count < KELLY_MIN_TRADES:
@@ -189,14 +193,23 @@ class KellySizer:
 
             win_rate = len(wins) / len(trades)
 
-            # Hitung return pct dari notional
-            def pnl_pct(trade) -> float:
+            # Hitung return pct dari notional. Skip trade tanpa notional valid —
+            # max(notional,1) bikin avg_win/loss dihitung dari $1 → Kelly 50x overstate.
+            def pnl_pct(trade) -> float | None:
                 entry = trade.entry or {}
-                notional = float(entry.get("notional", 1))
-                return abs(float(trade.realized_pnl)) / max(notional, 1)
+                try:
+                    notional = float(entry.get("notional") or 0)
+                except (TypeError, ValueError):
+                    notional = 0.0
+                if notional <= 0:
+                    return None
+                return abs(float(trade.realized_pnl)) / notional
 
-            avg_win = sum(pnl_pct(t) for t in wins) / len(wins) if wins else 0.0
-            avg_loss = sum(pnl_pct(t) for t in losses) / len(losses) if losses else 0.0
+            win_pcts = [p for p in (pnl_pct(t) for t in wins) if p is not None]
+            loss_pcts = [p for p in (pnl_pct(t) for t in losses) if p is not None]
+
+            avg_win = sum(win_pcts) / len(win_pcts) if win_pcts else 0.0
+            avg_loss = sum(loss_pcts) / len(loss_pcts) if loss_pcts else 0.0
 
             return win_rate, avg_win, avg_loss, len(trades)
 
