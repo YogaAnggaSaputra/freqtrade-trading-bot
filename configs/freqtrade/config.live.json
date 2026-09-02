@@ -730,7 +730,8 @@
         "pair_blacklist": [
             "币安人生/USDT:USDT",
             "我踏马来了/USDT:USDT",
-            "龙虾/USDT:USDT"
+            "龙虾/USDT:USDT",
+            "MARSCOIN/USDT:USDT"
         ],
         "skip_pair_validation": true,
         "pairlists": [

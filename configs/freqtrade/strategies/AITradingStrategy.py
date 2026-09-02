@@ -1091,6 +1091,27 @@ class AITradingStrategy(IStrategy):
             (dataframe["volume_ratio"]       >= self.volume_spike_factor.value)  &  # Gate 6: Volume
             ml_long_ok                                              # Gate 7: ML confirmation
         )
+        # [DEBUG] Log gate pass/fail counts untuk diagnosa 0-trade.
+        # Hanya log setiap 100 candle (jangan spam log).
+        if len(dataframe) % 100 == 0:
+            import logging
+            _gw_log = logging.getLogger("freqtrade.gates")
+            if _gw_log.isEnabledFor(logging.DEBUG):
+                g1 = (dataframe["in_killzone"] == 1).sum()
+                g2 = (dataframe["fomo_lock"] == 0).sum()
+                g3a = (dataframe["regime_macro"] != "TRENDING_BEAR").sum()
+                g3b = (dataframe["regime_tactical"] != "TRENDING_BEAR").sum()
+                g3c = (dataframe["regime_tactical"] != "RANGING").sum()
+                g4 = (dataframe["conf_score_long"] >= self.min_conf_long.value).sum()
+                g5 = (dataframe["adx"] >= self.adx_threshold.value).sum()
+                g6 = (dataframe["volume_ratio"] >= self.volume_spike_factor.value).sum()
+                g7 = (dataframe["ml_signal_direction"].isna() | (dataframe["ml_signal_direction"] != "SELL")).sum()
+                long_passes = long_gates.sum()
+                _gw_log.debug(
+                    "Gate stats %s: g1=%d g2=%d g3a=%d g3b=%d g4=%d g5=%d g6=%d g7=%d → long=%d",
+                    pair, g1, g2, g3a, g3b, g4, g5, g6, g7, long_passes
+                )
+
         dataframe.loc[long_gates, "enter_long"] = 1
         dataframe.loc[long_gates, "enter_tag"]  = "mtf_confluence_long"
 
@@ -1109,6 +1130,26 @@ class AITradingStrategy(IStrategy):
             (dataframe["volume_ratio"]       >= self.volume_spike_factor.value) &
             ml_short_ok
         )
+
+        # [DEBUG] Log gate pass/fail counts untuk diagnosa 0-trade.
+        if len(dataframe) % 100 == 0:
+            import logging
+            _gw_log = logging.getLogger("freqtrade.gates")
+            if _gw_log.isEnabledFor(logging.DEBUG):
+                s1 = (dataframe["in_killzone"] == 1).sum()
+                s2 = (dataframe["fomo_lock"] == 0).sum()
+                s3a = (dataframe["regime_macro"] != "TRENDING_BULL").sum()
+                s3b = (dataframe["regime_tactical"] != "TRENDING_BULL").sum()
+                sc = (dataframe["hurst_1h"].ge(0.45)).sum()
+                s4 = (dataframe["conf_score_short"] >= self.min_conf_short.value).sum()
+                s5 = (dataframe["adx"] >= self.adx_threshold.value).sum()
+                s6 = (dataframe["volume_ratio"] >= self.volume_spike_factor.value).sum()
+                s7 = (dataframe["ml_signal_direction"].isna() | (dataframe["ml_signal_direction"] != "BUY")).sum()
+                short_passes = short_gates.sum()
+                _gw_log.debug(
+                    "Gate stats %s: g1=%d g2=%d g3a=%d g3b=%d g4=%d g5=%d g6=%d g7=%d → short=%d",
+                    pair, s1, s2, s3a, s3b, s4, s5, s6, s7, short_passes
+                )
         dataframe.loc[short_gates, "enter_short"] = 1
         dataframe.loc[short_gates, "enter_tag"]   = "mtf_confluence_short"
 
@@ -1312,8 +1353,10 @@ class AITradingStrategy(IStrategy):
             age_candles = 999.0
         grace_active = age_candles < 5.0
 
-        # [FIX-CRITICAL] Urutan cek dibalik: 3R → 2R → 1R.
-        # Progressive lock: makin tinggi profit, SL makin ketat.
+        # [FIX-BUG] Hard floor: jika custom_stoploss return < 1.5%, Freqtrade
+        # bisa override dengan external SL (Binance conditional order, etc).
+        # Enforce 1.5% di sini sebagai guard terakhir sebelum return.
+        sl_pct = max(sl_pct, 0.015)
 
         # ── [LAYER-5] Progressive Lock di zona runner (2R+) ──
         # Tambah step lock baru: 3R lock 1.5R, 4R lock 2.5R
@@ -1375,7 +1418,7 @@ class AITradingStrategy(IStrategy):
                     # [LAYER-3] ATR-Based Trail Width
                     # Gunakan ATR live untuk menyesuaikan trail width
                     # Volatility tinggi → trail lebar, volatility rendah → trail sempit
-                    atr_trail_width = max(0.5 * atr, current_rate * 0.003)
+                    atr_trail_width = max(0.5 * atr, current_rate * 0.010)
                     trail_sl = current_rate + (trail_pct * peak_profit_abs)
                     # Pastikan trail tidak lebih lebar dari ATR trail width
                     sl_price = min(sl_initial, max(trail_sl, current_rate + atr_trail_width))
@@ -1399,7 +1442,10 @@ class AITradingStrategy(IStrategy):
                     sl_price = sl_initial
                 elif peak_profit_abs > 0 and current_profit >= 0.005:
                     # [LAYER-3] ATR-Based Trail Width
-                    atr_trail_width = max(0.5 * atr, current_rate * 0.003)
+                    # Min trail width: jangan lebih sempit dari 1.0% — noise 5m
+                    # biasanya 0.3-0.5%, kalau trail < noise → stop hunt terus.
+                    # (Sebelumnya max(0.5*atr, 0.3%) = 0.30% → SL kena noise normal.)
+                    atr_trail_width = max(0.5 * atr, current_rate * 0.010)
                     trail_sl = current_rate - (trail_pct * peak_profit_abs)
                     sl_price = max(sl_initial, min(trail_sl, current_rate - atr_trail_width))
                 else:
