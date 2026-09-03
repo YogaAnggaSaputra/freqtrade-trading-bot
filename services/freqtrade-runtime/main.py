@@ -100,7 +100,7 @@ def create_config(mode: str) -> str:
     # Tinggal 1 posisi (max_open_trades=1) — cukup 200 pair liquid, bukan 527.
     # VolumePairList = pencarian pair by volume di exchange (native Freqtrade).
     # Analisis 527 pair ≈ 130s (kelewatan ambang 75s) → 200 pair ≈ 50s, aman.
-    VOLUME_PAIR_LIMIT = 200
+    VOLUME_PAIR_LIMIT = 50
     logger.info(f"Generated whitelist with {len(top_pairs)} pairs from feather files (VolumePairList top {VOLUME_PAIR_LIMIT})")
     
     config = {
@@ -148,7 +148,7 @@ def create_config(mode: str) -> str:
         "minimal_roi": {"0": 0.50},
         "stoploss": -0.02,
         "trailing_stop": False,
-        "startup_candle_count": 200,
+        "startup_candle_count": 50,
         "exchange": {
             "name": "binanceusdm",
             "key": api_key,
@@ -189,7 +189,7 @@ def create_config(mode: str) -> str:
         "pairlists": [
             {
                 "method": "VolumePairList",
-                "number_assets": 200,
+                "number_assets": 50,
                 "sort_key": "quoteVolume",
                 "min_value": 0,
                 "refresh_period": 1800
@@ -199,7 +199,7 @@ def create_config(mode: str) -> str:
         "initial_state": "running",
         "force_entry": False,
         "internals": {
-            "process_throttle_secs": 5
+            "process_throttle_secs": 1
         }
     }
     

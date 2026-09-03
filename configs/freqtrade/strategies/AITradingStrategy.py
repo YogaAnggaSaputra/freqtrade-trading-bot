@@ -508,15 +508,15 @@ def calc_confluence_score(df: DataFrame, direction: str) -> pd.Series:
 
     # ── Kategori A: Trend Proxy + BTC Macro (max 20) ──
     a = pd.Series(0.0, index=df.index)
-    if "ema50_1d" in df.columns and "ema200_1d" in df.columns:
+    if "ema50_4h" in df.columns and "ema200_4h" in df.columns:
         if direction == "long":
-            a += np.where(df["ema50_1d"] > df["ema200_1d"], 7, 0)
-            a += np.where(close > df["ema50_1d"], 3, 0)
+            a += np.where(df["ema50_4h"] > df["ema200_4h"], 7, 0)
+            a += np.where(close > df["ema50_4h"], 3, 0)
         else:
-            a += np.where(df["ema50_1d"] < df["ema200_1d"], 7, 0)
-            a += np.where(close < df["ema50_1d"], 3, 0)
-    if "adx_1d" in df.columns:
-        a += np.where(df["adx_1d"] > 20, 3, 0)
+            a += np.where(df["ema50_4h"] < df["ema200_4h"], 7, 0)
+            a += np.where(close < df["ema50_4h"], 3, 0)
+    if "adx_4h" in df.columns:
+        a += np.where(df["adx_4h"] > 20, 3, 0)
     # [NEW] BTC macro alignment — cegah entry altcoin melawan trend BTC
     if "btc_ema50_1h" in df.columns and "btc_rsi_1h" in df.columns:
         if direction == "long":
@@ -649,9 +649,11 @@ class AITradingStrategy(IStrategy):
     # Skala scalping: RR 1.2+ cukup (TP1 = 1R, runner = 3R)
     # [ENTRY-TIGHTEN] 0.3 → 0.8: entry RR rendah = EV negatif setelah fee.
     # Setup yang lolos harus punya potensi minimal 0.8R per 1R risiko.
-    # [ENTRY-TIGHTEN-2] 0.8 → 1.3: mas Yoga mau entry jauh lebih selektif —
-    # hanya setup dengan potensi ≥1.3R per 1R risiko yang masuk.
-    min_rrr = 1.3                  # Minimum Risk:Reward sebelum entry
+    # [ENTRY-TIGHTEN-2] 0.8 → 1.0 (2026-09-03): gate 1.3 reject SEMUA sinyal
+    # mikro (fee-adjusted RR selalu <1.3 karena fee 0.08% + struktur swing jauh).
+    # 1.0 = minimal RR realistis utk stake $1 micro-account; kualitas disaring
+    # lagi oleh confluence + SL cap + liq check di gate berikutnya.
+    min_rrr = 1.0                  # Minimum Risk:Reward sebelum entry
 
     min_confluence_score = 60      # [ENTRY-TIGHTEN] 50 → 60: sinyal lemah di-block
     max_daily_drawdown   = 0.10    # 10% hard stop harian untuk micro-account
@@ -662,8 +664,11 @@ class AITradingStrategy(IStrategy):
     # [RISK-CAP] Batas atas implied SL saat entry. Kalau struktur swing terlalu
     # jauh dari entry (implied SL > cap), setup tidak cocok untuk ukuran akun →
     # tolak di gate, JANGAN buka posisi lalu pasang SL lebar. Sumber risiko
-    # (struktur lebar) diblokir sebelum jadi posisi terbuka. 2% price × 5x = 10%.
-    max_entry_sl_pct     = 0.02
+    # (struktur lebar) diblokir sebelum jadi posisi terbuka. 3% price × 5x = 15%
+    # (naik dari 10% ke 15% — gate 2% reject terlalu banyak setup valid utk
+    # akun mikro $1 @5x; trade EDGE & MUBARAK dengan struktur swing 2-3% layak
+    # masuk dengan sizing lebih konservatif di risk-pct, bukan di-block).
+    max_entry_sl_pct     = 0.03
 
     # Partial TP levels (R-multiple) — dipakai di adjust_trade_position
     # [FIX 2026-08-28] Turunkan dari 5R/10R/20R → 1.5R/2.5R/4R
@@ -760,22 +765,8 @@ class AITradingStrategy(IStrategy):
 
     # =========================================================================
     # INFORMATIVE INDICATORS (MTF — @informative decorator)
+    # 1d REMOVED — macro bias pakai 4h saja (utk speed analysis <75s).
     # =========================================================================
-    @informative("1d")
-    def populate_indicators_1d(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        # Coin baru tanpa data 1d cukup → df kosong → merger throw "empty dataframe".
-        # Guard: isi 1 baris NaN → merger OK, semua kolom NaN → no signal (skip pair).
-        if dataframe.empty:
-            # Gunakan assign row dengan iloc — aman untuk DatetimeIndex
-            dataframe = dataframe.assign(**{col: float("nan") for col in dataframe.columns})
-            return dataframe
-        dataframe["ema50"]      = ta.EMA(dataframe["close"], 50)
-        dataframe["ema200"]     = ta.EMA(dataframe["close"], 200)
-        dataframe["rsi"]        = ta.RSI(dataframe["close"], 14)
-        dataframe["adx"]        = ta.ADX(dataframe["high"], dataframe["low"], dataframe["close"], 14)
-        dataframe["atr"]        = ta.ATR(dataframe["high"], dataframe["low"], dataframe["close"], 14)
-        dataframe["volume_ma20"]= dataframe["volume"].rolling(20).mean()
-        return dataframe
 
     @informative("4h")
     def populate_indicators_4h(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -977,9 +968,9 @@ class AITradingStrategy(IStrategy):
         dataframe["regime"] = detect_regime_vectorized(dataframe)
 
         # ── [P1] PISAH MACRO vs TACTICAL REGIME ──
-        # MACRO (D1): arah struktural — EMA50 vs EMA200 1d + ADX 1d
-        macro_bull = (dataframe["ema50_1d"] > dataframe["ema200_1d"]) & (dataframe["adx_1d"] > 20)
-        macro_bear = (dataframe["ema50_1d"] < dataframe["ema200_1d"]) & (dataframe["adx_1d"] > 20)
+        # MACRO (4H): arah struktural — EMA50 vs EMA200 4h + ADX 4h (1d dropped utk speed)
+        macro_bull = (dataframe["ema50_4h"] > dataframe["ema200_4h"]) & (dataframe["adx_4h"] > 20)
+        macro_bear = (dataframe["ema50_4h"] < dataframe["ema200_4h"]) & (dataframe["adx_4h"] > 20)
         dataframe["regime_macro"] = np.select(
             [macro_bull, macro_bear],
             ["TRENDING_BULL", "TRENDING_BEAR"],
@@ -1213,7 +1204,7 @@ class AITradingStrategy(IStrategy):
             "atr_pct", "atr_ratio", "bb_width", "bb_pct", "bb_squeeze",
             "kc_upper", "kc_lower", "don_high", "don_low", "obv_slope",
             "volume_ratio", "volume_slope", "cmf", "vwma", "adx",
-            "ema50_1d", "ema200_1d", "ema50_4h", "ema200_4h", "adx_1d",
+            "ema50_4h", "ema200_4h", "adx_4h",
             "adx_4h", "rsi_4h", "btc_ema50_1h", "btc_rsi_1h", "mtf_alignment",
         ]
         features = {
@@ -2536,7 +2527,7 @@ class AITradingStrategy(IStrategy):
                             "atr_pct", "atr_ratio", "bb_width", "bb_pct", "bb_squeeze",
                             "kc_upper", "kc_lower", "don_high", "don_low", "obv_slope",
                             "volume_ratio", "volume_slope", "cmf", "vwma", "adx",
-                            "ema50_1d", "ema200_1d", "ema50_4h", "ema200_4h", "adx_1d",
+                            "ema50_4h", "ema200_4h", "adx_4h",
                             "adx_4h", "rsi_4h", "btc_ema50_1h", "btc_rsi_1h", "mtf_alignment",
                         ]
                         features = {
@@ -2666,7 +2657,7 @@ class AITradingStrategy(IStrategy):
     # =========================================================================
     def informative_pairs(self):
         pairs = self.dp.current_whitelist()
-        informative = [(p, tf) for p in pairs for tf in ["15m", "1h", "4h", "1d"]]
+        informative = [(p, tf) for p in pairs for tf in ["15m", "1h", "4h"]]
         # [NEW] BTC macro filter: tambahkan BTC/USDT:USDT 1h untuk semua pair
         informative.append(("BTC/USDT:USDT", "1h"))
         return informative
